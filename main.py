@@ -1,14 +1,11 @@
 import os
 import re
-import shutil
-import asyncio
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import xml.etree.ElementTree as ET
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -32,6 +29,10 @@ WAITING_FOR_RUB_AMOUNT = 1
 NBKR_DAILY_XML_URL = "https://www.nbkr.kg/XML/daily.xml"
 AIYL_BANK_URL = "https://abank.kg/ky"
 BAKAI_BANK_URL = "https://bakai.kg/"
+
+DEFAULT_BAKAI_FALLBACK = 1.2450
+DEFAULT_AIYL_FALLBACK = 1.2300
+DEFAULT_NBKR_FALLBACK = 1.2135
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
@@ -57,10 +58,14 @@ def format_rate(value: float) -> str:
 
 
 def parse_rate_value(text: str) -> float:
-    return float(text.strip().replace(",", "."))
+    return float(str(text).strip().replace(",", "."))
 
 
 def html_to_text(html: str) -> str:
+    """
+    Превращает HTML в простой текст.
+    Используется для Айыл Банка.
+    """
     text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.S | re.I)
     text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -69,29 +74,10 @@ def html_to_text(html: str) -> str:
     return text.strip()
 
 
-def find_chromium_executable() -> str | None:
-    """
-    Ищем Chromium в Railway/Nixpacks.
-    """
-    env_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
-    if env_path:
-        return env_path
-
-    candidates = [
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-    ]
-
-    for path in candidates:
-        if path:
-            return path
-
-    return None
-
-
 def get_nbkr_rub_rate() -> dict:
+    """
+    Получает официальный курс RUB/KGS из XML НБКР.
+    """
     try:
         response = requests.get(NBKR_DAILY_XML_URL, timeout=15)
         response.raise_for_status()
@@ -163,7 +149,137 @@ def get_nbkr_rub_rate() -> dict:
         }
 
 
+def get_bakai_cashless_rub_sell_rate() -> dict:
+    """
+    Получает безналичный курс продажи RUB с официального сайта Бакай Банка.
+
+    По результатам проверки сайта:
+    данные лежат внутри Next.js stream-скрипта в HTML.
+
+    Нужное поле:
+    RUB -> non_cash -> sell
+
+    Пример структуры:
+    "RUB": {
+        "name": "Российский рубль",
+        "cash": {"buy": 1.19, "sell": 1.23},
+        "transfer": {"buy": 1.14, "sell": 1.24},
+        "nbkr": {"rate": 1.2135},
+        "non_cash": {"buy": 1.18, "sell": 1.24}
+    }
+    """
+    try:
+        response = requests.get(
+            BAKAI_BANK_URL,
+            timeout=20,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; KgsRubBot/1.0; "
+                    "+https://github.com/ninokovank-blip/kgs-rub-bot)"
+                ),
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        response.raise_for_status()
+
+        html = response.text
+
+        # В HTML Next.js данные часто лежат в JS-строке с экранированными кавычками.
+        # Поэтому нормализуем их, чтобы проще искать JSON-подобные фрагменты.
+        normalized = html.replace('\\"', '"')
+        normalized = normalized.replace("\\/", "/")
+
+        date_match = re.search(
+            r'"last_execution"\s*:\s*"([^"]+)"',
+            normalized,
+            flags=re.S,
+        )
+        site_date = date_match.group(1) if date_match else "дата не найдена"
+
+        pattern = (
+            r'"RUB"\s*:\s*\{.*?'
+            r'"non_cash"\s*:\s*\{'
+            r'\s*"buy"\s*:\s*([0-9]+(?:\.[0-9]+)?|null)\s*,'
+            r'\s*"sell"\s*:\s*([0-9]+(?:\.[0-9]+)?|null)'
+        )
+
+        match = re.search(pattern, normalized, flags=re.S)
+
+        if not match:
+            return {
+                "ok": False,
+                "rate": None,
+                "buy_rate": None,
+                "sell_rate": None,
+                "date": site_date,
+                "error": (
+                    "Не удалось найти RUB -> non_cash -> sell "
+                    "в HTML-скриптах официального сайта Бакай Банка."
+                ),
+            }
+
+        buy_text = match.group(1)
+        sell_text = match.group(2)
+
+        if buy_text == "null" or sell_text == "null":
+            return {
+                "ok": False,
+                "rate": None,
+                "buy_rate": None,
+                "sell_rate": None,
+                "date": site_date,
+                "error": "В данных Бакай Банка RUB/non_cash содержит null вместо курса.",
+            }
+
+        rub_buy = parse_rate_value(buy_text)
+        rub_sell = parse_rate_value(sell_text)
+
+        if rub_sell <= 0:
+            return {
+                "ok": False,
+                "rate": None,
+                "buy_rate": rub_buy,
+                "sell_rate": rub_sell,
+                "date": site_date,
+                "error": "Найденный курс продажи RUB Бакай Банка некорректен.",
+            }
+
+        return {
+            "ok": True,
+            "rate": rub_sell,
+            "buy_rate": rub_buy,
+            "sell_rate": rub_sell,
+            "date": site_date,
+            "error": None,
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "rate": None,
+            "buy_rate": None,
+            "sell_rate": None,
+            "date": None,
+            "error": f"Ошибка запроса к официальному сайту Бакай Банка: {exc}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "rate": None,
+            "buy_rate": None,
+            "sell_rate": None,
+            "date": None,
+            "error": f"Неожиданная ошибка при получении курса Бакай Банка: {exc}",
+        }
+
+
 def get_aiyl_cashless_rub_sell_rate() -> dict:
+    """
+    Получает безналичный курс продажи RUB с официального сайта Айыл Банка / A-bank.
+
+    Текущая логика основана на HTML-тексте официального сайта.
+    Для MVP используем найденный ранее второй банковский блок курсов.
+    """
     try:
         response = requests.get(
             AIYL_BANK_URL,
@@ -172,7 +288,8 @@ def get_aiyl_cashless_rub_sell_rate() -> dict:
                 "User-Agent": (
                     "Mozilla/5.0 (compatible; KgsRubBot/1.0; "
                     "+https://github.com/ninokovank-blip/kgs-rub-bot)"
-                )
+                ),
+                "Accept-Language": "ky-KG,ky;q=0.9,ru-RU;q=0.8,ru;q=0.7,en-US;q=0.6,en;q=0.5",
             },
         )
         response.raise_for_status()
@@ -248,168 +365,24 @@ def get_aiyl_cashless_rub_sell_rate() -> dict:
         }
 
 
-def extract_bakai_rub_sell_from_text(text: str) -> dict:
-    normalized_text = re.sub(r"\s+", " ", text).strip()
-
-    date_time_match = re.search(
-        r"Курс указан на\s+(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})",
-        normalized_text,
-        flags=re.I,
-    )
-    site_date = date_time_match.group(1) if date_time_match else "дата не найдена"
-
-    block_match = re.search(
-        r"Курсы валют\s+Безналичные.*?Покупка\s+Продажа(?P<body>.*?)(?:Все курсы|Калькулятор)",
-        normalized_text,
-        flags=re.S | re.I,
-    )
-
-    if not block_match:
-        return {
-            "ok": False,
-            "rate": None,
-            "buy_rate": None,
-            "sell_rate": None,
-            "date": site_date,
-            "error": "Не удалось найти блок 'Курсы валют / Безналичные' в тексте официального сайта Бакай Банка.",
-        }
-
-    rates_block = block_match.group("body")
-
-    pairs = re.findall(
-        r"([0-9]+(?:[.,][0-9]+)?)\s+([0-9]+(?:[.,][0-9]+)?)",
-        rates_block,
-    )
-
-    if len(pairs) < 3:
-        return {
-            "ok": False,
-            "rate": None,
-            "buy_rate": None,
-            "sell_rate": None,
-            "date": site_date,
-            "error": (
-                "В блоке безналичных курсов Бакай Банка найдено меньше трёх валютных строк. "
-                "Невозможно уверенно определить RUB."
-            ),
-        }
-
-    rub_buy_text, rub_sell_text = pairs[2]
-    rub_buy = parse_rate_value(rub_buy_text)
-    rub_sell = parse_rate_value(rub_sell_text)
-
-    if rub_sell <= 0:
-        return {
-            "ok": False,
-            "rate": None,
-            "buy_rate": rub_buy,
-            "sell_rate": rub_sell,
-            "date": site_date,
-            "error": "Найденный курс продажи RUB Бакай Банка некорректен.",
-        }
-
-    return {
-        "ok": True,
-        "rate": rub_sell,
-        "buy_rate": rub_buy,
-        "sell_rate": rub_sell,
-        "date": site_date,
-        "error": None,
-    }
-
-
-def get_bakai_cashless_rub_sell_rate() -> dict:
-    """
-    Синхронная функция Playwright.
-
-    Важно:
-    Telegram-бот асинхронный, поэтому эту функцию нельзя вызывать напрямую
-    внутри async handler. Ниже мы вызываем её через asyncio.to_thread().
-    """
-    try:
-        chromium_path = find_chromium_executable()
-
-        with sync_playwright() as p:
-            launch_kwargs = {
-                "headless": True,
-                "args": [
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-setuid-sandbox",
-                ],
-            }
-
-            if chromium_path:
-                launch_kwargs["executable_path"] = chromium_path
-
-            browser = p.chromium.launch(**launch_kwargs)
-
-            page = browser.new_page(
-                locale="ru-RU",
-                viewport={"width": 1280, "height": 1600},
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-
-            page.goto(BAKAI_BANK_URL, wait_until="domcontentloaded", timeout=45000)
-
-            try:
-                page.wait_for_selector("text=Курсы валют", timeout=30000)
-            except PlaywrightTimeoutError:
-                browser.close()
-                return {
-                    "ok": False,
-                    "rate": None,
-                    "buy_rate": None,
-                    "sell_rate": None,
-                    "date": None,
-                    "error": "Playwright открыл сайт Бакай Банка, но не дождался блока 'Курсы валют'.",
-                }
-
-            page.wait_for_timeout(3000)
-            text = page.evaluate("() => document.body.innerText")
-
-            browser.close()
-
-        result = extract_bakai_rub_sell_from_text(text)
-
-        if result["ok"]:
-            return result
-
-        short_text = text[:1000].replace("\n", " ")
-        result["error"] = f"{result['error']} Фрагмент текста: {short_text}"
-        return result
-
-    except Exception as exc:
-        return {
-            "ok": False,
-            "rate": None,
-            "buy_rate": None,
-            "sell_rate": None,
-            "date": None,
-            "error": f"Ошибка Playwright при получении курса Бакай Банка: {exc}",
-        }
-
-
 async def get_rates_async() -> dict:
     """
     Единая функция получения курсов.
 
-    Бакай через Playwright запускаем в отдельном потоке,
-    чтобы не конфликтовать с async Telegram-ботом.
+    Источники:
+    - Бакай Банк: официальный сайт, Next.js stream в HTML, RUB/non_cash/sell;
+    - Айыл Банк: официальный сайт;
+    - НБКР: официальный XML.
     """
     nbkr_data = get_nbkr_rub_rate()
     aiyl_data = get_aiyl_cashless_rub_sell_rate()
-    bakai_data = await asyncio.to_thread(get_bakai_cashless_rub_sell_rate)
+    bakai_data = get_bakai_cashless_rub_sell_rate()
 
     if nbkr_data["ok"]:
         nbkr_rate = nbkr_data["rate"]
         nbkr_status = f"НБКР получен из официального XML, дата курса: {nbkr_data['date']}"
     else:
-        nbkr_rate = 1.2135
+        nbkr_rate = DEFAULT_NBKR_FALLBACK
         nbkr_status = f"НБКР не получен, используется тестовый fallback. Причина: {nbkr_data['error']}"
 
     if aiyl_data["ok"]:
@@ -419,7 +392,7 @@ async def get_rates_async() -> dict:
             f"безналичная продажа RUB, дата сайта: {aiyl_data['date']}"
         )
     else:
-        aiyl_rate = 1.2300
+        aiyl_rate = DEFAULT_AIYL_FALLBACK
         aiyl_status = (
             "Айыл Банк не получен, используется тестовый fallback. "
             f"Причина: {aiyl_data['error']}"
@@ -428,11 +401,11 @@ async def get_rates_async() -> dict:
     if bakai_data["ok"]:
         bakai_rate = bakai_data["rate"]
         bakai_status = (
-            f"Бакай Банк получен с официального сайта через браузерный парсер, "
-            f"безналичная продажа RUB, дата сайта: {bakai_data['date']}"
+            f"Бакай Банк получен с официального сайта, "
+            f"RUB / non_cash / sell, дата обновления: {bakai_data['date']}"
         )
     else:
-        bakai_rate = 1.2450
+        bakai_rate = DEFAULT_BAKAI_FALLBACK
         bakai_status = (
             "Бакай Банк не получен, используется тестовый fallback. "
             f"Причина: {bakai_data['error']}"
@@ -452,6 +425,13 @@ async def get_rates_async() -> dict:
 
 
 def parse_amount_text(text: str) -> float | None:
+    """
+    Распознаёт сумму RUB из текста.
+    Примеры:
+    250000000
+    250 000 000
+    250000000 RUB
+    """
     if not text:
         return None
 
@@ -482,6 +462,10 @@ def parse_amount_text(text: str) -> float | None:
 
 
 def get_best_bank_by_rate(rates: dict) -> dict:
+    """
+    Для покупки RUB за KGS выгоднее тот банк,
+    у которого ниже курс продажи RUB.
+    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
 
@@ -519,6 +503,9 @@ def get_best_bank_by_rate(rates: dict) -> dict:
 
 
 def calculate_purchase_cost(target_rub: float, rates: dict) -> dict:
+    """
+    Расчёт потребности в KGS для покупки заданной суммы RUB.
+    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
     nbkr_rate = rates["nbkr"]
@@ -779,17 +766,36 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()
+    text = update.message.text.strip().lower()
 
-    if text == "📊 Курсы сейчас":
+    if text in [
+        "📊 курсы сейчас",
+        "курсы",
+        "курс",
+        "курс сейчас",
+        "текущие курсы",
+        "какой банк выгоднее",
+    ]:
         await rates(update, context)
         return
 
-    if text == "🧮 Калькулятор":
+    if text in [
+        "🧮 калькулятор",
+        "калькулятор",
+        "рассчитать",
+        "расчет",
+        "расчёт",
+        "купить rub",
+        "купить рубли",
+    ]:
         await calc_start(update, context)
         return
 
-    if text == "❓ Помощь":
+    if text in [
+        "❓ помощь",
+        "помощь",
+        "help",
+    ]:
         await help_command(update, context)
         return
 

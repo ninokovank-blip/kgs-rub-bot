@@ -115,16 +115,15 @@ def format_source_datetime(value: str | None) -> str:
         return value
 
 
-def sync_to_google_sheets(payload: dict) -> None:
+def sync_to_google_sheets(payload: dict) -> dict | None:
     """
     Отправляет событие в Google Apps Script.
 
-    Важно:
-    если Google Sheets временно недоступен, бот всё равно продолжает работать.
-    Ошибка только пишется в логи Railway.
+    Если Google Sheets временно недоступен, бот продолжает работать.
+    Возвращает ответ Google Apps Script или None при ошибке.
     """
     if not GOOGLE_APPS_SCRIPT_URL:
-        return
+        return None
 
     try:
         payload_with_secret = {
@@ -144,19 +143,22 @@ def sync_to_google_sheets(payload: dict) -> None:
                 response.status_code,
                 response.text[:500],
             )
-            return
+            return None
 
         try:
             result = response.json()
         except Exception:
             logging.warning("Google Sheets sync returned non-json response: %s", response.text[:500])
-            return
+            return None
 
         if not result.get("ok"):
             logging.warning("Google Sheets sync error: %s", result)
 
+        return result
+
     except Exception as exc:
         logging.exception("Ошибка синхронизации с Google Sheets: %s", exc)
+        return None
 
 
 def load_json_file(path: str, default_value):
@@ -223,6 +225,56 @@ def save_users(data: dict) -> None:
     save_json_file(USERS_FILE, data)
 
 
+def get_active_subscribers_from_google() -> set[int] | None:
+    """
+    Получает активных подписчиков из Google Sheets.
+
+    Возвращает:
+    - set(chat_id), если Google Sheets ответил успешно;
+    - None, если Google Sheets недоступен или вернул ошибку.
+
+    Пустой set означает, что активных подписчиков реально нет.
+    None означает техническую ошибку, тогда используем резервный subscribers.json.
+    """
+    result = sync_to_google_sheets(
+        {
+            "event_type": "get_active_subscribers",
+        }
+    )
+
+    if not result or not result.get("ok"):
+        return None
+
+    raw_chat_ids = result.get("active_chat_ids", [])
+
+    active_subscribers = set()
+
+    for chat_id in raw_chat_ids:
+        try:
+            active_subscribers.add(int(chat_id))
+        except Exception:
+            continue
+
+    return active_subscribers
+
+
+def get_effective_subscribers() -> set[int]:
+    """
+    Основной источник подписчиков — Google Sheets.
+    Резервный источник — локальный subscribers.json.
+    """
+    google_subscribers = get_active_subscribers_from_google()
+
+    if google_subscribers is not None:
+        return google_subscribers
+
+    return load_subscribers()
+
+
+def is_user_subscribed(chat_id: int) -> bool:
+    return chat_id in get_effective_subscribers()
+
+
 def track_user(update: Update, action: str) -> None:
     if not update.effective_chat or not update.effective_user:
         return
@@ -239,7 +291,7 @@ def track_user(update: Update, action: str) -> None:
 
     actions_count = int(existing.get("actions_count", 0)) + 1
     first_seen = existing.get("first_seen", now)
-    is_subscribed = chat_id in load_subscribers()
+    is_subscribed = is_user_subscribed(chat_id)
 
     users[key] = {
         "chat_id": chat_id,
@@ -860,7 +912,7 @@ def build_notification_message(rates_data: dict) -> str:
 def build_users_report() -> str:
     data = load_users()
     users = data.get("users", {})
-    subscribers = load_subscribers()
+    subscribers = get_effective_subscribers()
 
     if not users:
         return "Пока нет зафиксированных пользователей."
@@ -1112,12 +1164,14 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    added = add_subscriber(chat_id)
 
-    track_user(update, "subscribe")
+    already_subscribed = is_user_subscribed(chat_id)
+
+    add_subscriber(chat_id)
     sync_subscriber_update(update, True)
+    track_user(update, "subscribe")
 
-    if added:
+    if not already_subscribed:
         message = (
             "Готово, вы подписаны на рассылку курсов.\n\n"
             "Уведомления будут приходить в будние дни по Бишкекскому времени:\n"
@@ -1136,12 +1190,14 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    removed = remove_subscriber(chat_id)
 
-    track_user(update, "unsubscribe")
+    was_subscribed = is_user_subscribed(chat_id)
+
+    remove_subscriber(chat_id)
     sync_subscriber_update(update, False)
+    track_user(update, "unsubscribe")
 
-    if removed:
+    if was_subscribed:
         message = "Готово, рассылка отключена."
     else:
         message = "Вы не были подписаны на рассылку."
@@ -1197,7 +1253,7 @@ async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     SENT_NOTIFICATION_KEYS.add(notification_key)
 
-    subscribers = load_subscribers()
+    subscribers = get_effective_subscribers()
 
     if not subscribers:
         return

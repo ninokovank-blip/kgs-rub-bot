@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 import xml.etree.ElementTree as ET
 
 import requests
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,6 +28,23 @@ WAITING_FOR_RUB_AMOUNT = 1
 NBKR_DAILY_XML_URL = "https://www.nbkr.kg/XML/daily.xml"
 
 
+def main_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Основные кнопки меню в Telegram.
+    """
+    keyboard = [
+        [KeyboardButton("📊 Курсы сейчас"), KeyboardButton("🧮 Калькулятор")],
+        [KeyboardButton("❓ Помощь")],
+    ]
+
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выберите действие или введите команду",
+    )
+
+
 def format_number(value: float, digits: int = 2) -> str:
     return f"{value:,.{digits}f}".replace(",", " ")
 
@@ -47,26 +64,15 @@ def parse_rate_value(text: str) -> float:
 def get_nbkr_rub_rate() -> dict:
     """
     Получает официальный курс RUB/KGS из XML НБКР.
-
-    Ожидаемая логика XML:
-    <CurrencyRates Date="...">
-        <Currency ISOCode="RUB">
-            <Nominal>1</Nominal>
-            <Value>...</Value>
-        </Currency>
-    </CurrencyRates>
     """
     try:
         response = requests.get(NBKR_DAILY_XML_URL, timeout=15)
         response.raise_for_status()
 
-        # XML НБКР может быть в windows-1251.
-        # requests обычно определяет кодировку, но подстрахуемся.
         if not response.encoding:
             response.encoding = "windows-1251"
 
         root = ET.fromstring(response.text)
-
         xml_date = root.attrib.get("Date", "дата не указана")
 
         for currency in root.findall("Currency"):
@@ -93,8 +99,6 @@ def get_nbkr_rub_rate() -> dict:
                         "error": "В XML НБКР некорректный Nominal для RUB.",
                     }
 
-                # Если НБКР отдаёт курс за 1 RUB, nominal = 1.
-                # Если когда-то будет nominal = 10 или 100, приводим к курсу за 1 RUB.
                 rate_for_1_rub = value / nominal
 
                 return {
@@ -151,8 +155,6 @@ def get_rates() -> dict:
         nbkr_rate = nbkr_data["rate"]
         nbkr_status = f"НБКР получен из официального XML, дата курса: {nbkr_data['date']}"
     else:
-        # Важно: если НБКР не получен, временно ставим тестовое значение,
-        # но явно помечаем, что данные неполные.
         nbkr_rate = 1.2135
         nbkr_status = f"НБКР не получен, используется тестовый fallback. Причина: {nbkr_data['error']}"
 
@@ -199,6 +201,10 @@ def parse_amount_text(text: str) -> float | None:
 
 
 def get_best_bank_by_rate(rates: dict) -> dict:
+    """
+    Для покупки RUB за KGS выгоднее тот банк,
+    у которого ниже курс продажи RUB.
+    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
 
@@ -236,6 +242,12 @@ def get_best_bank_by_rate(rates: dict) -> dict:
 
 
 def calculate_purchase_cost(target_rub: float, rates: dict) -> dict:
+    """
+    Считает, сколько KGS потребуется для покупки заданной суммы RUB.
+
+    Формула:
+    стоимость в KGS = сумма RUB × курс продажи RUB
+    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
     nbkr_rate = rates["nbkr"]
@@ -361,7 +373,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Главная логика:\n"
         "вы вводите, сколько RUB нужно купить, "
         "а я считаю, сколько KGS потребуется через каждый банк.\n\n"
-        "Доступные команды:\n"
+        "Выберите действие кнопкой ниже или используйте команды:\n"
         "/rates — показать текущие курсы и лучший банк сейчас\n"
         "/calc — открыть калькулятор покупки RUB\n"
         "/help — помощь\n\n"
@@ -369,25 +381,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "а НБКР уже подтягивается из официального XML."
     )
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, reply_markup=main_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
-        "Доступные команды:\n\n"
-        "/start — запуск бота\n"
-        "/rates — показать текущие курсы и лучший банк сейчас\n"
-        "/calc — открыть калькулятор покупки RUB\n"
-        "/help — помощь\n\n"
+        "Помощь\n\n"
+        "Основные действия:\n"
+        "📊 Курсы сейчас — показать текущие курсы и лучший банк\n"
+        "🧮 Калькулятор — ввести сумму RUB и рассчитать потребность в KGS\n\n"
         "Как пользоваться калькулятором:\n"
-        "1. Напишите /calc\n"
+        "1. Нажмите кнопку 🧮 Калькулятор или напишите /calc\n"
         "2. Бот попросит ввести сумму RUB\n"
         "3. Введите сумму, например: 250000000\n\n"
         "Важно:\n"
         "вводимая сумма — это сумма RUB, которую нужно купить."
     )
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, reply_markup=main_keyboard())
 
 
 async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -429,7 +440,7 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Статус данных: {rates_data['source_status']}"
     )
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, reply_markup=main_keyboard())
 
 
 async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -439,7 +450,7 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         rates_data = get_rates()
         result = calculate_purchase_cost(target_rub, rates_data)
         message = build_calculator_message(result, rates_data["source_status"])
-        await update.message.reply_text(message)
+        await update.message.reply_text(message, reply_markup=main_keyboard())
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -447,7 +458,7 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Введите сумму RUB, которую нужно купить.\n\n"
         "Пример:\n"
         "250000000\n\n"
-        "Для отмены напишите /cancel."
+        "Для отмены напишите /cancel.",
     )
 
     return WAITING_FOR_RUB_AMOUNT
@@ -469,12 +480,12 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, reply_markup=main_keyboard())
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Калькулятор закрыт.")
+    await update.message.reply_text("Калькулятор закрыт.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
 
@@ -484,7 +495,8 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if target_rub is None:
         await update.message.reply_text(
             "Для расчёта используйте калькулятор:\n"
-            "/calc"
+            "/calc",
+            reply_markup=main_keyboard(),
         )
         return
 
@@ -492,7 +504,32 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, reply_markup=main_keyboard())
+
+
+async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обрабатывает нажатия на кнопки-клавиатуру.
+    """
+    text = update.message.text.strip()
+
+    if text == "📊 Курсы сейчас":
+        await rates(update, context)
+        return
+
+    if text == "🧮 Калькулятор":
+        await calc_start(update, context)
+        return
+
+    if text == "❓ Помощь":
+        await help_command(update, context)
+        return
+
+    await update.message.reply_text(
+        "Не понял команду.\n\n"
+        "Выберите действие кнопкой ниже или напишите /help.",
+        reply_markup=main_keyboard(),
+    )
 
 
 def main() -> None:
@@ -507,7 +544,10 @@ def main() -> None:
     app = Application.builder().token(bot_token).build()
 
     calc_conversation = ConversationHandler(
-        entry_points=[CommandHandler("calc", calc_start)],
+        entry_points=[
+            CommandHandler("calc", calc_start),
+            MessageHandler(filters.Regex("^🧮 Калькулятор$"), calc_start),
+        ],
         states={
             WAITING_FOR_RUB_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, calc_amount_received)
@@ -525,6 +565,9 @@ def main() -> None:
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("compare", buy))
     app.add_handler(CommandHandler("compare_now", buy))
+
+    # Обработка остальных кнопок и обычного текста
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_buttons))
 
     app.run_polling()
 

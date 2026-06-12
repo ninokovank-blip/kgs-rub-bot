@@ -2,7 +2,9 @@ import os
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import xml.etree.ElementTree as ET
 
+import requests
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -21,77 +23,163 @@ logging.basicConfig(
 
 
 BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
-
-# Состояние диалога для калькулятора
 WAITING_FOR_RUB_AMOUNT = 1
+
+NBKR_DAILY_XML_URL = "https://www.nbkr.kg/XML/daily.xml"
 
 
 def format_number(value: float, digits: int = 2) -> str:
-    """
-    Красиво форматирует числа:
-    1234567.89 -> 1 234 567.89
-    """
     return f"{value:,.{digits}f}".replace(",", " ")
 
 
 def format_rate(value: float) -> str:
-    """
-    Формат курса с 4 знаками после запятой.
-    """
     return f"{value:.4f}"
 
 
-def get_test_rates() -> dict:
+def parse_rate_value(text: str) -> float:
     """
-    Тестовые курсы.
-
-    Сейчас это НЕ реальные данные.
-    Мы используем их только для проверки логики, формул и текста сообщений.
-
-    Позже заменим эту функцию на реальные источники:
-    - Бакай Банк;
-    - Айыл Банк / A-bank;
-    - НБКР.
+    Преобразует курс из текста в число.
+    НБКР часто отдаёт значения с запятой: 1,2135.
     """
+    return float(text.strip().replace(",", "."))
+
+
+def get_nbkr_rub_rate() -> dict:
+    """
+    Получает официальный курс RUB/KGS из XML НБКР.
+
+    Ожидаемая логика XML:
+    <CurrencyRates Date="...">
+        <Currency ISOCode="RUB">
+            <Nominal>1</Nominal>
+            <Value>...</Value>
+        </Currency>
+    </CurrencyRates>
+    """
+    try:
+        response = requests.get(NBKR_DAILY_XML_URL, timeout=15)
+        response.raise_for_status()
+
+        # XML НБКР может быть в windows-1251.
+        # requests обычно определяет кодировку, но подстрахуемся.
+        if not response.encoding:
+            response.encoding = "windows-1251"
+
+        root = ET.fromstring(response.text)
+
+        xml_date = root.attrib.get("Date", "дата не указана")
+
+        for currency in root.findall("Currency"):
+            if currency.attrib.get("ISOCode") == "RUB":
+                nominal_text = currency.findtext("Nominal")
+                value_text = currency.findtext("Value")
+
+                if not nominal_text or not value_text:
+                    return {
+                        "ok": False,
+                        "rate": None,
+                        "date": xml_date,
+                        "error": "В XML НБКР найдена валюта RUB, но отсутствует Nominal или Value.",
+                    }
+
+                nominal = parse_rate_value(nominal_text)
+                value = parse_rate_value(value_text)
+
+                if nominal <= 0:
+                    return {
+                        "ok": False,
+                        "rate": None,
+                        "date": xml_date,
+                        "error": "В XML НБКР некорректный Nominal для RUB.",
+                    }
+
+                # Если НБКР отдаёт курс за 1 RUB, nominal = 1.
+                # Если когда-то будет nominal = 10 или 100, приводим к курсу за 1 RUB.
+                rate_for_1_rub = value / nominal
+
+                return {
+                    "ok": True,
+                    "rate": rate_for_1_rub,
+                    "date": xml_date,
+                    "error": None,
+                }
+
+        return {
+            "ok": False,
+            "rate": None,
+            "date": xml_date,
+            "error": "В XML НБКР не найдена валюта RUB.",
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "rate": None,
+            "date": None,
+            "error": f"Ошибка запроса к НБКР: {exc}",
+        }
+    except ET.ParseError as exc:
+        return {
+            "ok": False,
+            "rate": None,
+            "date": None,
+            "error": f"Ошибка разбора XML НБКР: {exc}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "rate": None,
+            "date": None,
+            "error": f"Неожиданная ошибка при получении курса НБКР: {exc}",
+        }
+
+
+def get_rates() -> dict:
+    """
+    Единая функция получения курсов.
+
+    Сейчас:
+    - Бакай Банк: тестовый курс;
+    - Айыл Банк: тестовый курс;
+    - НБКР: реальный официальный курс из XML.
+
+    Следующими этапами заменим Бакай и Айыл на реальные источники.
+    """
+    nbkr_data = get_nbkr_rub_rate()
+
+    if nbkr_data["ok"]:
+        nbkr_rate = nbkr_data["rate"]
+        nbkr_status = f"НБКР получен из официального XML, дата курса: {nbkr_data['date']}"
+    else:
+        # Важно: если НБКР не получен, временно ставим тестовое значение,
+        # но явно помечаем, что данные неполные.
+        nbkr_rate = 1.2135
+        nbkr_status = f"НБКР не получен, используется тестовый fallback. Причина: {nbkr_data['error']}"
+
     return {
         "bakai": 1.2450,
         "aiyl": 1.2300,
-        "nbkr": 1.2135,
-        "source_status": "Тестовые данные, не для финансового решения",
+        "nbkr": nbkr_rate,
+        "source_status": (
+            "Бакай и Айыл — тестовые данные; "
+            f"{nbkr_status}. "
+            "Не использовать для финансового решения до подключения банковских источников."
+        ),
     }
 
 
 def parse_amount_text(text: str) -> float | None:
-    """
-    Преобразует введённую пользователем сумму в число.
-
-    Поддерживает варианты:
-    250000000
-    250 000 000
-    250,000,000
-    250.000.000
-    250000000 RUB
-    250000000 руб
-
-    Возвращает None, если сумма не распознана.
-    """
     if not text:
         return None
 
     cleaned = text.strip()
-
-    # Убираем частые текстовые добавки
     cleaned = cleaned.replace("RUB", "")
     cleaned = cleaned.replace("rub", "")
     cleaned = cleaned.replace("РУБ", "")
     cleaned = cleaned.replace("руб", "")
     cleaned = cleaned.replace("₽", "")
-
-    # Убираем пробелы
     cleaned = cleaned.replace(" ", "")
 
-    # Если пользователь ввёл 250,000,000 или 250.000.000,
-    # считаем запятые/точки разделителями тысяч.
     if cleaned.count(",") > 0 and cleaned.count(".") == 0:
         cleaned = cleaned.replace(",", "")
     elif cleaned.count(".") > 1 and cleaned.count(",") == 0:
@@ -111,12 +199,6 @@ def parse_amount_text(text: str) -> float | None:
 
 
 def get_best_bank_by_rate(rates: dict) -> dict:
-    """
-    Определяет лучший банк только по курсу.
-
-    Для покупки RUB за KGS выгоднее тот банк,
-    у которого ниже курс продажи RUB.
-    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
 
@@ -154,17 +236,6 @@ def get_best_bank_by_rate(rates: dict) -> dict:
 
 
 def calculate_purchase_cost(target_rub: float, rates: dict) -> dict:
-    """
-    Считает, сколько KGS потребуется для покупки заданной суммы RUB.
-
-    Бизнес-логика:
-    компания покупает RUB за KGS.
-    Курс показывает, сколько KGS стоит 1 RUB.
-    Чем ниже курс продажи RUB, тем выгоднее банк.
-
-    Формула:
-    стоимость в KGS = сумма RUB × курс продажи RUB
-    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
     nbkr_rate = rates["nbkr"]
@@ -215,9 +286,6 @@ def calculate_purchase_cost(target_rub: float, rates: dict) -> dict:
 
 
 def build_calculator_message(result: dict, source_status: str) -> str:
-    """
-    Собирает текст Telegram-сообщения для калькулятора покупки RUB.
-    """
     now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
 
     if result["best_bank"] == "Курсы равны":
@@ -279,14 +347,6 @@ def build_calculator_message(result: dict, source_status: str) -> str:
 
 
 def parse_target_rub_from_command(context: ContextTypes.DEFAULT_TYPE) -> float | None:
-    """
-    Позволяет написать:
-    /calc 250000000
-    /buy 250000000
-
-    Смысл суммы:
-    сколько RUB нужно купить.
-    """
     if not context.args:
         return None
 
@@ -305,8 +365,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/rates — показать текущие курсы и лучший банк сейчас\n"
         "/calc — открыть калькулятор покупки RUB\n"
         "/help — помощь\n\n"
-        "Сейчас используются тестовые данные. "
-        "На следующих этапах подключим реальные источники банков и НБКР."
+        "Сейчас Бакай и Айыл используются как тестовые данные, "
+        "а НБКР уже подтягивается из официального XML."
     )
 
     await update.message.reply_text(message)
@@ -316,7 +376,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message = (
         "Доступные команды:\n\n"
         "/start — запуск бота\n"
-        "/rates — показать текущие тестовые курсы и лучший банк сейчас\n"
+        "/rates — показать текущие курсы и лучший банк сейчас\n"
         "/calc — открыть калькулятор покупки RUB\n"
         "/help — помощь\n\n"
         "Как пользоваться калькулятором:\n"
@@ -331,7 +391,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    rates_data = get_test_rates()
+    rates_data = get_rates()
     best_info = get_best_bank_by_rate(rates_data)
     now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
 
@@ -364,9 +424,6 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{format_number(bakai_spread_pct, 2)}%\n"
         f"Айыл Банк / A-bank: {format_rate(aiyl_spread_abs)} KGS / "
         f"{format_number(aiyl_spread_pct, 2)}%\n\n"
-        "Логика:\n"
-        "это курс продажи RUB, то есть сколько KGS стоит 1 RUB.\n"
-        "Чем ниже курс, тем выгоднее покупка RUB.\n\n"
         "Комментарий:\n"
         f"{conclusion}\n\n"
         f"Статус данных: {rates_data['source_status']}"
@@ -376,20 +433,10 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Команда /calc.
-
-    Если сумма указана сразу технически:
-    /calc 250000000
-    бот сразу считает.
-
-    Но в меню мы это не показываем, чтобы интерфейс был проще:
-    /calc -> ввести сумму отдельным сообщением.
-    """
     target_rub = parse_target_rub_from_command(context)
 
     if target_rub is not None:
-        rates_data = get_test_rates()
+        rates_data = get_rates()
         result = calculate_purchase_cost(target_rub, rates_data)
         message = build_calculator_message(result, rates_data["source_status"])
         await update.message.reply_text(message)
@@ -407,9 +454,6 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Получает сумму RUB после команды /calc.
-    """
     target_rub = parse_amount_text(update.message.text)
 
     if target_rub is None:
@@ -421,7 +465,7 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return WAITING_FOR_RUB_AMOUNT
 
-    rates_data = get_test_rates()
+    rates_data = get_rates()
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
@@ -435,12 +479,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Старая команда /buy.
-    Оставляем как скрытый дубль для удобства.
-
-    Если написать /buy без суммы, бот предложит использовать /calc.
-    """
     target_rub = parse_target_rub_from_command(context)
 
     if target_rub is None:
@@ -450,7 +488,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    rates_data = get_test_rates()
+    rates_data = get_rates()
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
@@ -481,11 +519,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("rates", rates))
-
-    # Основной калькулятор
     app.add_handler(calc_conversation)
 
-    # Скрытые дубли: оставляем, чтобы старые команды не ломались
+    # Скрытые дубли
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("compare", buy))
     app.add_handler(CommandHandler("compare_now", buy))

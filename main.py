@@ -70,6 +70,8 @@ def parse_amount_text(text: str) -> float | None:
     250 000 000
     250,000,000
     250.000.000
+    250000000 RUB
+    250000000 руб
 
     Возвращает None, если сумма не распознана.
     """
@@ -81,6 +83,7 @@ def parse_amount_text(text: str) -> float | None:
     # Убираем частые текстовые добавки
     cleaned = cleaned.replace("RUB", "")
     cleaned = cleaned.replace("rub", "")
+    cleaned = cleaned.replace("РУБ", "")
     cleaned = cleaned.replace("руб", "")
     cleaned = cleaned.replace("₽", "")
 
@@ -245,7 +248,7 @@ def build_calculator_message(result: dict, source_status: str) -> str:
     return (
         "Калькулятор покупки RUB за KGS\n"
         f"Дата и время: {now} Бишкек\n\n"
-        f"Курсы RUB / KGS, безналичная продажа:\n"
+        "Курсы RUB / KGS, безналичная продажа:\n"
         f"Бакай Банк: {format_rate(result['bakai_rate'])}\n"
         f"Айыл Банк / A-bank: {format_rate(result['aiyl_rate'])}\n"
         f"НБКР: {format_rate(result['nbkr_rate'])}\n\n"
@@ -278,8 +281,8 @@ def build_calculator_message(result: dict, source_status: str) -> str:
 def parse_target_rub_from_command(context: ContextTypes.DEFAULT_TYPE) -> float | None:
     """
     Позволяет написать:
-    /buy 250000000
     /calc 250000000
+    /buy 250000000
 
     Смысл суммы:
     сколько RUB нужно купить.
@@ -301,7 +304,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Доступные команды:\n"
         "/rates — показать текущие курсы и лучший банк сейчас\n"
         "/calc — открыть калькулятор покупки RUB\n"
-        "/calc 250000000 — сразу рассчитать покупку 250 000 000 RUB\n"
         "/help — помощь\n\n"
         "Сейчас используются тестовые данные. "
         "На следующих этапах подключим реальные источники банков и НБКР."
@@ -316,13 +318,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start — запуск бота\n"
         "/rates — показать текущие тестовые курсы и лучший банк сейчас\n"
         "/calc — открыть калькулятор покупки RUB\n"
-        "/calc сумма — рассчитать покупку нужной суммы RUB\n\n"
+        "/help — помощь\n\n"
+        "Как пользоваться калькулятором:\n"
+        "1. Напишите /calc\n"
+        "2. Бот попросит ввести сумму RUB\n"
+        "3. Введите сумму, например: 250000000\n\n"
         "Важно:\n"
-        "сумма после команды /calc — это сумма RUB, которую нужно купить.\n\n"
-        "Примеры:\n"
-        "/calc 250000000\n"
-        "/calc 100000000\n\n"
-        "Можно также написать /calc, а потом отдельным сообщением ввести сумму."
+        "вводимая сумма — это сумма RUB, которую нужно купить."
     )
 
     await update.message.reply_text(message)
@@ -377,12 +379,12 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Команда /calc.
 
-    Если сумма указана сразу:
+    Если сумма указана сразу технически:
     /calc 250000000
     бот сразу считает.
 
-    Если сумма не указана:
-    бот просит ввести сумму следующим сообщением.
+    Но в меню мы это не показываем, чтобы интерфейс был проще:
+    /calc -> ввести сумму отдельным сообщением.
     """
     target_rub = parse_target_rub_from_command(context)
 
@@ -434,8 +436,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Быстрая старая команда /buy.
-    Оставляем как дубль для удобства.
+    Старая команда /buy.
+    Оставляем как скрытый дубль для удобства.
 
     Если написать /buy без суммы, бот предложит использовать /calc.
     """
@@ -443,10 +445,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if target_rub is None:
         await update.message.reply_text(
-            "Для расчёта укажите сумму RUB.\n\n"
-            "Пример:\n"
-            "/buy 250000000\n\n"
-            "Или используйте калькулятор:\n"
+            "Для расчёта используйте калькулятор:\n"
             "/calc"
         )
         return
@@ -486,7 +485,7 @@ def main() -> None:
     # Основной калькулятор
     app.add_handler(calc_conversation)
 
-    # Дубли для удобства
+    # Скрытые дубли: оставляем, чтобы старые команды не ломались
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("compare", buy))
     app.add_handler(CommandHandler("compare_now", buy))

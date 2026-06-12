@@ -36,20 +36,28 @@ DEFAULT_AIYL_FALLBACK = 1.2300
 DEFAULT_NBKR_FALLBACK = 1.2135
 
 SUBSCRIBERS_FILE = "subscribers.json"
+USERS_FILE = "users.json"
 
-# Рассылка в будние дни по Бишкеку: 07:00, 09:00, 11:00, 13:00, 15:00, 17:00.
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "439636200"))
+
 NOTIFICATION_HOURS = {7, 9, 11, 13, 15, 17}
-
-# Защита от повторной отправки одного и того же уведомления в рамках одного запуска бота.
 SENT_NOTIFICATION_KEYS = set()
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
+def is_admin_chat_id(chat_id: int | None) -> bool:
+    return chat_id == ADMIN_CHAT_ID
+
+
+def main_keyboard(chat_id: int | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton("📊 Курсы сейчас"), KeyboardButton("🧮 Калькулятор")],
         [KeyboardButton("🔔 Подписаться на рассылку"), KeyboardButton("🔕 Отписаться")],
-        [KeyboardButton("❓ Помощь")],
     ]
+
+    if is_admin_chat_id(chat_id):
+        keyboard.append([KeyboardButton("👥 Пользователи"), KeyboardButton("❓ Помощь")])
+    else:
+        keyboard.append([KeyboardButton("❓ Помощь")])
 
     return ReplyKeyboardMarkup(
         keyboard,
@@ -57,6 +65,11 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         one_time_keyboard=False,
         input_field_placeholder="Выберите действие или введите команду",
     )
+
+
+def keyboard_for_update(update: Update) -> ReplyKeyboardMarkup:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    return main_keyboard(chat_id)
 
 
 def format_number(value: float, digits: int = 2) -> str:
@@ -81,12 +94,6 @@ def html_to_text(html: str) -> str:
 
 
 def format_source_datetime(value: str | None) -> str:
-    """
-    Приводит техническую дату сайта к нормальному виду.
-
-    Пример:
-    2026-06-12T18:42:11.189063 -> 12.06.2026 18:42
-    """
     if not value or value == "дата не найдена":
         return "дата не найдена"
 
@@ -97,51 +104,41 @@ def format_source_datetime(value: str | None) -> str:
         return value
 
 
-def load_subscribers() -> set[int]:
-    """
-    Загружает список подписчиков из локального JSON-файла.
-
-    Для MVP этого достаточно.
-    Если в будущем пользователей станет много, лучше перенести хранение в Google Sheets
-    или базу данных.
-    """
-    if not os.path.exists(SUBSCRIBERS_FILE):
-        return set()
+def load_json_file(path: str, default_value):
+    if not os.path.exists(path):
+        return default_value
 
     try:
-        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        chat_ids = data.get("chat_ids", [])
-        return {int(chat_id) for chat_id in chat_ids}
-
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
     except Exception as exc:
-        logging.exception("Ошибка чтения файла подписчиков: %s", exc)
-        return set()
+        logging.exception("Ошибка чтения файла %s: %s", path, exc)
+        return default_value
+
+
+def save_json_file(path: str, data) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logging.exception("Ошибка сохранения файла %s: %s", path, exc)
+
+
+def load_subscribers() -> set[int]:
+    data = load_json_file(SUBSCRIBERS_FILE, {"chat_ids": []})
+    chat_ids = data.get("chat_ids", [])
+    return {int(chat_id) for chat_id in chat_ids}
 
 
 def save_subscribers(subscribers: set[int]) -> None:
-    """
-    Сохраняет список подписчиков в локальный JSON-файл.
-    """
-    try:
-        data = {
-            "chat_ids": sorted(list(subscribers)),
-            "updated_at": datetime.now(BISHKEK_TZ).isoformat(),
-        }
-
-        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
-
-    except Exception as exc:
-        logging.exception("Ошибка сохранения файла подписчиков: %s", exc)
+    data = {
+        "chat_ids": sorted(list(subscribers)),
+        "updated_at": datetime.now(BISHKEK_TZ).isoformat(),
+    }
+    save_json_file(SUBSCRIBERS_FILE, data)
 
 
 def add_subscriber(chat_id: int) -> bool:
-    """
-    Добавляет подписчика.
-    Возвращает True, если подписчик был добавлен впервые.
-    """
     subscribers = load_subscribers()
 
     if chat_id in subscribers:
@@ -153,10 +150,6 @@ def add_subscriber(chat_id: int) -> bool:
 
 
 def remove_subscriber(chat_id: int) -> bool:
-    """
-    Удаляет подписчика.
-    Возвращает True, если подписчик был найден и удалён.
-    """
     subscribers = load_subscribers()
 
     if chat_id not in subscribers:
@@ -167,11 +160,51 @@ def remove_subscriber(chat_id: int) -> bool:
     return True
 
 
+def load_users() -> dict:
+    return load_json_file(USERS_FILE, {"users": {}})
+
+
+def save_users(data: dict) -> None:
+    save_json_file(USERS_FILE, data)
+
+
+def track_user(update: Update, action: str) -> None:
+    if not update.effective_chat or not update.effective_user:
+        return
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    data = load_users()
+    users = data.setdefault("users", {})
+
+    key = str(chat_id)
+    existing = users.get(key, {})
+
+    users[key] = {
+        "chat_id": chat_id,
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "first_seen": existing.get("first_seen", now),
+        "last_seen": now,
+        "actions_count": int(existing.get("actions_count", 0)) + 1,
+        "last_action": action,
+    }
+
+    data["updated_at"] = datetime.now(BISHKEK_TZ).isoformat()
+    save_users(data)
+
+
+def is_admin(update: Update) -> bool:
+    if not update.effective_chat:
+        return False
+
+    return update.effective_chat.id == ADMIN_CHAT_ID
+
+
 def get_nbkr_rub_rate() -> dict:
-    """
-    Получает официальный курс RUB/KGS с сайта НБКР.
-    Технически используется официальный XML-файл НБКР.
-    """
     try:
         response = requests.get(NBKR_DAILY_XML_URL, timeout=15)
         response.raise_for_status()
@@ -244,12 +277,6 @@ def get_nbkr_rub_rate() -> dict:
 
 
 def get_bakai_cashless_rub_sell_rate() -> dict:
-    """
-    Получает безналичный курс продажи RUB с официального сайта Бакай Банка.
-
-    Нужное поле:
-    RUB -> non_cash -> sell
-    """
     try:
         response = requests.get(
             BAKAI_BANK_URL,
@@ -354,9 +381,6 @@ def get_bakai_cashless_rub_sell_rate() -> dict:
 
 
 def get_aiyl_cashless_rub_sell_rate() -> dict:
-    """
-    Получает безналичный курс продажи RUB с официального сайта Айыл Банка / A-bank.
-    """
     try:
         response = requests.get(
             AIYL_BANK_URL,
@@ -443,14 +467,6 @@ def get_aiyl_cashless_rub_sell_rate() -> dict:
 
 
 async def get_rates_async() -> dict:
-    """
-    Единая функция получения курсов.
-
-    Источники:
-    - Бакай Банк: официальный сайт, RUB / безналичная продажа;
-    - Айыл Банк / A-bank: официальный сайт, RUB / безналичная продажа;
-    - НБКР: официальный сайт НБКР.
-    """
     nbkr_data = get_nbkr_rub_rate()
     aiyl_data = get_aiyl_cashless_rub_sell_rate()
     bakai_data = get_bakai_cashless_rub_sell_rate()
@@ -503,9 +519,6 @@ async def get_rates_async() -> dict:
 
 
 def parse_amount_text(text: str) -> float | None:
-    """
-    Распознаёт сумму RUB из текста.
-    """
     if not text:
         return None
 
@@ -536,10 +549,6 @@ def parse_amount_text(text: str) -> float | None:
 
 
 def get_best_bank_by_rate(rates: dict) -> dict:
-    """
-    Для покупки RUB за KGS выгоднее тот банк,
-    у которого ниже курс продажи RUB.
-    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
 
@@ -577,9 +586,6 @@ def get_best_bank_by_rate(rates: dict) -> dict:
 
 
 def calculate_purchase_cost(target_rub: float, rates: dict) -> dict:
-    """
-    Расчёт потребности в KGS для покупки заданной суммы RUB.
-    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
     nbkr_rate = rates["nbkr"]
@@ -692,9 +698,6 @@ def build_calculator_message(result: dict, source_status: str) -> str:
 
 
 def build_notification_message(rates_data: dict) -> str:
-    """
-    Короткое сообщение для автоматической рассылки.
-    """
     best_info = get_best_bank_by_rate(rates_data)
     now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
 
@@ -731,6 +734,56 @@ def build_notification_message(rates_data: dict) -> str:
     )
 
 
+def build_users_report() -> str:
+    data = load_users()
+    users = data.get("users", {})
+    subscribers = load_subscribers()
+
+    if not users:
+        return "Пока нет зафиксированных пользователей."
+
+    sorted_users = sorted(
+        users.values(),
+        key=lambda item: item.get("last_seen", ""),
+        reverse=True,
+    )
+
+    lines = [
+        "Пользователи бота",
+        f"Всего пользователей: {len(sorted_users)}",
+        f"Подписчиков на рассылку: {len(subscribers)}",
+        "",
+    ]
+
+    for index, user in enumerate(sorted_users[:30], start=1):
+        chat_id = int(user.get("chat_id", 0))
+        username = user.get("username") or ""
+        first_name = user.get("first_name") or ""
+        last_name = user.get("last_name") or ""
+        full_name = f"{first_name} {last_name}".strip() or "имя не указано"
+
+        username_text = f"@{username}" if username else "username не указан"
+        subscribed_text = "да" if chat_id in subscribers else "нет"
+
+        lines.extend(
+            [
+                f"{index}. {full_name} / {username_text}",
+                f"chat_id: {chat_id}",
+                f"первый запуск: {user.get('first_seen', 'н/д')}",
+                f"последняя активность: {user.get('last_seen', 'н/д')}",
+                f"действий: {user.get('actions_count', 0)}",
+                f"последнее действие: {user.get('last_action', 'н/д')}",
+                f"рассылка: {subscribed_text}",
+                "",
+            ]
+        )
+
+    if len(sorted_users) > 30:
+        lines.append(f"Показаны последние 30 пользователей из {len(sorted_users)}.")
+
+    return "\n".join(lines)
+
+
 def parse_target_rub_from_command(context: ContextTypes.DEFAULT_TYPE) -> float | None:
     if not context.args:
         return None
@@ -739,7 +792,37 @@ def parse_target_rub_from_command(context: ContextTypes.DEFAULT_TYPE) -> float |
     return parse_amount_text(raw_amount)
 
 
+async def show_users_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    report = build_users_report()
+
+    if len(report) <= 4000:
+        await update.message.reply_text(report, reply_markup=keyboard_for_update(update))
+        return
+
+    chunks = [report[i:i + 4000] for i in range(0, len(report), 4000)]
+
+    for chunk in chunks:
+        await update.message.reply_text(chunk, reply_markup=keyboard_for_update(update))
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        track_user(update, "unknown_command_users")
+
+        await update.message.reply_text(
+            "Не понял команду.\n\n"
+            "Выберите действие кнопкой ниже или напишите /help.",
+            reply_markup=keyboard_for_update(update),
+        )
+        return
+
+    track_user(update, "users")
+    await show_users_to_admin(update, context)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update, "start")
+
     message = (
         "Здравствуйте!\n\n"
         "Я бот для мониторинга курсов RUB / KGS.\n\n"
@@ -766,10 +849,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — помощь"
     )
 
-    await update.message.reply_text(message, reply_markup=main_keyboard())
+    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update, "help")
+
     message = (
         "Помощь по боту\n\n"
         "Основные кнопки:\n\n"
@@ -801,10 +886,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "для покупки RUB за KGS выгоднее тот банк, у которого ниже курс продажи RUB."
     )
 
-    await update.message.reply_text(message, reply_markup=main_keyboard())
+    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
 
 
 async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update, "rates")
+
     rates_data = await get_rates_async()
     best_info = get_best_bank_by_rate(rates_data)
     now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
@@ -844,17 +931,19 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{rates_data['source_status']}"
     )
 
-    await update.message.reply_text(message, reply_markup=main_keyboard())
+    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
 
 
 async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    track_user(update, "calc_start")
+
     target_rub = parse_target_rub_from_command(context)
 
     if target_rub is not None:
         rates_data = await get_rates_async()
         result = calculate_purchase_cost(target_rub, rates_data)
         message = build_calculator_message(result, rates_data["source_status"])
-        await update.message.reply_text(message, reply_markup=main_keyboard())
+        await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -863,12 +952,15 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Пример:\n"
         "1000000\n\n"
         "Для отмены напишите /cancel.",
+        reply_markup=keyboard_for_update(update),
     )
 
     return WAITING_FOR_RUB_AMOUNT
 
 
 async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    track_user(update, "calc_amount_received")
+
     target_rub = parse_amount_text(update.message.text)
 
     if target_rub is None:
@@ -876,7 +968,8 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
             "Не удалось распознать сумму.\n\n"
             "Введите только сумму RUB числом, например:\n"
             "1000000\n\n"
-            "Для отмены напишите /cancel."
+            "Для отмены напишите /cancel.",
+            reply_markup=keyboard_for_update(update),
         )
         return WAITING_FOR_RUB_AMOUNT
 
@@ -884,11 +977,13 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
-    await update.message.reply_text(message, reply_markup=main_keyboard())
+    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
     return ConversationHandler.END
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update, "subscribe")
+
     chat_id = update.effective_chat.id
     added = add_subscriber(chat_id)
 
@@ -906,10 +1001,12 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "07:00, 09:00, 11:00, 13:00, 15:00 и 17:00."
         )
 
-    await update.message.reply_text(message, reply_markup=main_keyboard())
+    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
 
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update, "unsubscribe")
+
     chat_id = update.effective_chat.id
     removed = remove_subscriber(chat_id)
 
@@ -918,22 +1015,26 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         message = "Вы не были подписаны на рассылку."
 
-    await update.message.reply_text(message, reply_markup=main_keyboard())
+    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Калькулятор закрыт.", reply_markup=main_keyboard())
+    track_user(update, "cancel")
+
+    await update.message.reply_text("Калькулятор закрыт.", reply_markup=keyboard_for_update(update))
     return ConversationHandler.END
 
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update, "buy")
+
     target_rub = parse_target_rub_from_command(context)
 
     if target_rub is None:
         await update.message.reply_text(
             "Для расчёта используйте калькулятор:\n"
             "/calc",
-            reply_markup=main_keyboard(),
+            reply_markup=keyboard_for_update(update),
         )
         return
 
@@ -941,29 +1042,18 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
-    await update.message.reply_text(message, reply_markup=main_keyboard())
+    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
 
 
 async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Плановая рассылка.
-
-    Проверка запускается каждую минуту.
-    Отправка происходит только в будние дни по Бишкеку:
-    07:00, 09:00, 11:00, 13:00, 15:00, 17:00.
-
-    Чтобы не было дублей, используется ключ дата + час.
-    """
     now = datetime.now(BISHKEK_TZ)
 
-    # weekday(): понедельник = 0, воскресенье = 6
     if now.weekday() >= 5:
         return
 
     if now.hour not in NOTIFICATION_HOURS:
         return
 
-    # Небольшое окно на случай, если задача сработает не ровно в 00 секунд.
     if now.minute > 4:
         return
 
@@ -987,7 +1077,7 @@ async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=message,
-                reply_markup=main_keyboard(),
+                reply_markup=main_keyboard(chat_id),
             )
         except Exception as exc:
             logging.exception("Ошибка отправки уведомления chat_id=%s: %s", chat_id, exc)
@@ -1040,6 +1130,24 @@ async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if text in [
+        "👥 пользователи",
+        "пользователи",
+    ]:
+        if is_admin(update):
+            track_user(update, "users_button")
+            await show_users_to_admin(update, context)
+            return
+
+        track_user(update, "unknown_text_users_button")
+
+        await update.message.reply_text(
+            "Не понял команду.\n\n"
+            "Выберите действие кнопкой ниже или напишите /help.",
+            reply_markup=keyboard_for_update(update),
+        )
+        return
+
+    if text in [
         "❓ помощь",
         "помощь",
         "help",
@@ -1047,10 +1155,12 @@ async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await help_command(update, context)
         return
 
+    track_user(update, "unknown_text")
+
     await update.message.reply_text(
         "Не понял команду.\n\n"
         "Выберите действие кнопкой ниже или напишите /help.",
-        reply_markup=main_keyboard(),
+        reply_markup=keyboard_for_update(update),
     )
 
 
@@ -1083,6 +1193,7 @@ def main() -> None:
     app.add_handler(CommandHandler("rates", rates))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    app.add_handler(CommandHandler("users", users_command))
     app.add_handler(calc_conversation)
 
     app.add_handler(CommandHandler("buy", buy))

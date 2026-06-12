@@ -2,7 +2,6 @@
 nixPkgs = [
   "python311",
   "python311Packages.pip",
-  "chromium",
   "nss",
   "nspr",
   "atk",
@@ -28,11 +27,11 @@ nixPkgs = [
   "alsa-lib"
 ]
 
-[phases.build]
+[phases.install]
 cmds = [
   "pip install -r requirements.txt",
   "python -m playwright install chromium"
 ]
 
 [start]
-cmd = "python main.py"
+cmd = "python -m playwright install chromium && python main.py"

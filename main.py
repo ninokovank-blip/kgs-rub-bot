@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -34,10 +35,19 @@ DEFAULT_BAKAI_FALLBACK = 1.2450
 DEFAULT_AIYL_FALLBACK = 1.2300
 DEFAULT_NBKR_FALLBACK = 1.2135
 
+SUBSCRIBERS_FILE = "subscribers.json"
+
+# Рассылка в будние дни по Бишкеку: 07:00, 09:00, 11:00, 13:00, 15:00, 17:00.
+NOTIFICATION_HOURS = {7, 9, 11, 13, 15, 17}
+
+# Защита от повторной отправки одного и того же уведомления в рамках одного запуска бота.
+SENT_NOTIFICATION_KEYS = set()
+
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton("📊 Курсы сейчас"), KeyboardButton("🧮 Калькулятор")],
+        [KeyboardButton("🔔 Подписаться на рассылку"), KeyboardButton("🔕 Отписаться")],
         [KeyboardButton("❓ Помощь")],
     ]
 
@@ -85,6 +95,76 @@ def format_source_datetime(value: str | None) -> str:
         return parsed.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return value
+
+
+def load_subscribers() -> set[int]:
+    """
+    Загружает список подписчиков из локального JSON-файла.
+
+    Для MVP этого достаточно.
+    Если в будущем пользователей станет много, лучше перенести хранение в Google Sheets
+    или базу данных.
+    """
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return set()
+
+    try:
+        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        chat_ids = data.get("chat_ids", [])
+        return {int(chat_id) for chat_id in chat_ids}
+
+    except Exception as exc:
+        logging.exception("Ошибка чтения файла подписчиков: %s", exc)
+        return set()
+
+
+def save_subscribers(subscribers: set[int]) -> None:
+    """
+    Сохраняет список подписчиков в локальный JSON-файл.
+    """
+    try:
+        data = {
+            "chat_ids": sorted(list(subscribers)),
+            "updated_at": datetime.now(BISHKEK_TZ).isoformat(),
+        }
+
+        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+
+    except Exception as exc:
+        logging.exception("Ошибка сохранения файла подписчиков: %s", exc)
+
+
+def add_subscriber(chat_id: int) -> bool:
+    """
+    Добавляет подписчика.
+    Возвращает True, если подписчик был добавлен впервые.
+    """
+    subscribers = load_subscribers()
+
+    if chat_id in subscribers:
+        return False
+
+    subscribers.add(chat_id)
+    save_subscribers(subscribers)
+    return True
+
+
+def remove_subscriber(chat_id: int) -> bool:
+    """
+    Удаляет подписчика.
+    Возвращает True, если подписчик был найден и удалён.
+    """
+    subscribers = load_subscribers()
+
+    if chat_id not in subscribers:
+        return False
+
+    subscribers.remove(chat_id)
+    save_subscribers(subscribers)
+    return True
 
 
 def get_nbkr_rub_rate() -> dict:
@@ -611,6 +691,46 @@ def build_calculator_message(result: dict, source_status: str) -> str:
     )
 
 
+def build_notification_message(rates_data: dict) -> str:
+    """
+    Короткое сообщение для автоматической рассылки.
+    """
+    best_info = get_best_bank_by_rate(rates_data)
+    now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
+
+    bakai_spread_abs = rates_data["bakai"] - rates_data["nbkr"]
+    aiyl_spread_abs = rates_data["aiyl"] - rates_data["nbkr"]
+
+    bakai_spread_pct = ((rates_data["bakai"] / rates_data["nbkr"]) - 1) * 100
+    aiyl_spread_pct = ((rates_data["aiyl"] / rates_data["nbkr"]) - 1) * 100
+
+    if best_info["best_bank"] == "Курсы равны":
+        conclusion = "Курсы банков равны."
+    else:
+        conclusion = (
+            f"Выгоднее сейчас: {best_info['best_bank']} "
+            "за счёт более низкого курса продажи RUB."
+        )
+
+    return (
+        "Плановое уведомление по курсам RUB / KGS\n"
+        f"Дата и время: {now} Бишкек\n\n"
+        "Тип курса: безналичная продажа RUB\n\n"
+        f"Бакай Банк: {format_rate(rates_data['bakai'])}\n"
+        f"Айыл Банк / A-bank: {format_rate(rates_data['aiyl'])}\n"
+        f"НБКР: {format_rate(rates_data['nbkr'])}\n\n"
+        f"{conclusion}\n\n"
+        "Разница между банками:\n"
+        f"{format_rate(best_info['absolute_difference'])} KGS за 1 RUB / "
+        f"{format_number(best_info['percent_difference'], 2)}%\n\n"
+        "Спред к НБКР:\n"
+        f"• Бакай Банк: {format_rate(bakai_spread_abs)} KGS / {format_number(bakai_spread_pct, 2)}%\n"
+        f"• Айыл Банк / A-bank: {format_rate(aiyl_spread_abs)} KGS / {format_number(aiyl_spread_pct, 2)}%\n\n"
+        "Чтобы открыть калькулятор, нажмите 🧮 Калькулятор.\n"
+        "Чтобы отключить рассылку, нажмите 🔕 Отписаться."
+    )
+
+
 def parse_target_rub_from_command(context: ContextTypes.DEFAULT_TYPE) -> float | None:
     if not context.args:
         return None
@@ -627,17 +747,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• текущие курсы Бакай Банка, Айыл Банка / A-bank и НБКР;\n"
         "• какой банк выгоднее для покупки RUB за KGS;\n"
         "• спред каждого банка к курсу НБКР;\n"
-        "• расчёт потребности в KGS для покупки заданной суммы RUB.\n\n"
+        "• расчёт потребности в KGS для покупки заданной суммы RUB;\n"
+        "• плановые уведомления по курсам в будние дни.\n\n"
         "Главная логика:\n"
         "вы вводите, сколько RUB нужно купить, а я считаю, сколько KGS потребуется через каждый банк.\n\n"
         "Доступные действия:\n"
         "📊 Курсы сейчас — показать актуальные курсы и лучший банк на текущий момент\n"
         "🧮 Калькулятор — рассчитать, сколько KGS потребуется для покупки нужной суммы RUB\n"
+        "🔔 Подписаться на рассылку — получать курсы в будние дни с 07:00 до 17:00 по Бишкеку\n"
+        "🔕 Отписаться — отключить автоматические уведомления\n"
         "❓ Помощь — посмотреть описание команд и логики расчёта\n\n"
         "Команды:\n"
         "/start — перезапустить бота и показать главное меню\n"
         "/rates — показать текущие курсы\n"
         "/calc — открыть калькулятор покупки RUB\n"
+        "/subscribe — подписаться на рассылку\n"
+        "/unsubscribe — отписаться от рассылки\n"
         "/help — помощь"
     )
 
@@ -654,12 +779,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🧮 Калькулятор\n"
         "Используется, когда нужно купить конкретную сумму RUB. "
         "Вы вводите сумму RUB, а бот считает, сколько KGS потребуется через каждый банк.\n\n"
+        "🔔 Подписаться на рассылку\n"
+        "Включает автоматические уведомления по курсам. "
+        "Рассылка приходит в будние дни по Бишкекскому времени: 07:00, 09:00, 11:00, 13:00, 15:00 и 17:00.\n\n"
+        "🔕 Отписаться\n"
+        "Отключает автоматические уведомления по курсам.\n\n"
         "❓ Помощь\n"
         "Показывает описание кнопок, команд и логики расчёта.\n\n"
         "Команды:\n"
         "/start — открыть главное меню\n"
         "/rates — показать текущие курсы и лучший банк сейчас\n"
         "/calc — открыть калькулятор покупки RUB\n"
+        "/subscribe — подписаться на рассылку\n"
+        "/unsubscribe — отписаться от рассылки\n"
         "/help — показать эту справку\n\n"
         "Как пользоваться калькулятором:\n"
         "1. Нажмите 🧮 Калькулятор или напишите /calc\n"
@@ -756,6 +888,39 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    added = add_subscriber(chat_id)
+
+    if added:
+        message = (
+            "Готово, вы подписаны на рассылку курсов.\n\n"
+            "Уведомления будут приходить в будние дни по Бишкекскому времени:\n"
+            "07:00, 09:00, 11:00, 13:00, 15:00 и 17:00.\n\n"
+            "Чтобы отключить рассылку, нажмите 🔕 Отписаться или напишите /unsubscribe."
+        )
+    else:
+        message = (
+            "Вы уже подписаны на рассылку курсов.\n\n"
+            "Уведомления приходят в будние дни по Бишкекскому времени:\n"
+            "07:00, 09:00, 11:00, 13:00, 15:00 и 17:00."
+        )
+
+    await update.message.reply_text(message, reply_markup=main_keyboard())
+
+
+async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    removed = remove_subscriber(chat_id)
+
+    if removed:
+        message = "Готово, рассылка отключена."
+    else:
+        message = "Вы не были подписаны на рассылку."
+
+    await update.message.reply_text(message, reply_markup=main_keyboard())
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Калькулятор закрыт.", reply_markup=main_keyboard())
     return ConversationHandler.END
@@ -777,6 +942,55 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = build_calculator_message(result, rates_data["source_status"])
 
     await update.message.reply_text(message, reply_markup=main_keyboard())
+
+
+async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Плановая рассылка.
+
+    Проверка запускается каждую минуту.
+    Отправка происходит только в будние дни по Бишкеку:
+    07:00, 09:00, 11:00, 13:00, 15:00, 17:00.
+
+    Чтобы не было дублей, используется ключ дата + час.
+    """
+    now = datetime.now(BISHKEK_TZ)
+
+    # weekday(): понедельник = 0, воскресенье = 6
+    if now.weekday() >= 5:
+        return
+
+    if now.hour not in NOTIFICATION_HOURS:
+        return
+
+    # Небольшое окно на случай, если задача сработает не ровно в 00 секунд.
+    if now.minute > 4:
+        return
+
+    notification_key = now.strftime("%Y-%m-%d-%H")
+
+    if notification_key in SENT_NOTIFICATION_KEYS:
+        return
+
+    SENT_NOTIFICATION_KEYS.add(notification_key)
+
+    subscribers = load_subscribers()
+
+    if not subscribers:
+        return
+
+    rates_data = await get_rates_async()
+    message = build_notification_message(rates_data)
+
+    for chat_id in subscribers:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                reply_markup=main_keyboard(),
+            )
+        except Exception as exc:
+            logging.exception("Ошибка отправки уведомления chat_id=%s: %s", chat_id, exc)
 
 
 async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -805,6 +1019,24 @@ async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "купить рубли",
     ]:
         await calc_start(update, context)
+        return
+
+    if text in [
+        "🔔 подписаться на рассылку",
+        "подписаться",
+        "подписка",
+        "включить рассылку",
+    ]:
+        await subscribe(update, context)
+        return
+
+    if text in [
+        "🔕 отписаться",
+        "отписаться",
+        "отключить рассылку",
+        "убрать рассылку",
+    ]:
+        await unsubscribe(update, context)
         return
 
     if text in [
@@ -849,6 +1081,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("rates", rates))
+    app.add_handler(CommandHandler("subscribe", subscribe))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(calc_conversation)
 
     app.add_handler(CommandHandler("buy", buy))
@@ -856,6 +1090,13 @@ def main() -> None:
     app.add_handler(CommandHandler("compare_now", buy))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_buttons))
+
+    app.job_queue.run_repeating(
+        scheduled_rates_job,
+        interval=60,
+        first=10,
+        name="scheduled_rates_notifications",
+    )
 
     app.run_polling()
 

@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -26,12 +27,10 @@ BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
 WAITING_FOR_RUB_AMOUNT = 1
 
 NBKR_DAILY_XML_URL = "https://www.nbkr.kg/XML/daily.xml"
+AIYL_BANK_URL = "https://abank.kg/ky"
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
-    """
-    Основные кнопки меню в Telegram.
-    """
     keyboard = [
         [KeyboardButton("📊 Курсы сейчас"), KeyboardButton("🧮 Калькулятор")],
         [KeyboardButton("❓ Помощь")],
@@ -54,10 +53,6 @@ def format_rate(value: float) -> str:
 
 
 def parse_rate_value(text: str) -> float:
-    """
-    Преобразует курс из текста в число.
-    НБКР часто отдаёт значения с запятой: 1,2135.
-    """
     return float(text.strip().replace(",", "."))
 
 
@@ -99,11 +94,9 @@ def get_nbkr_rub_rate() -> dict:
                         "error": "В XML НБКР некорректный Nominal для RUB.",
                     }
 
-                rate_for_1_rub = value / nominal
-
                 return {
                     "ok": True,
-                    "rate": rate_for_1_rub,
+                    "rate": value / nominal,
                     "date": xml_date,
                     "error": None,
                 }
@@ -138,18 +131,136 @@ def get_nbkr_rub_rate() -> dict:
         }
 
 
+def get_aiyl_cashless_rub_sell_rate() -> dict:
+    """
+    Получает безналичный курс продажи RUB с сайта Айыл Банка / A-bank.
+
+    Логика:
+    на странице идут три блока:
+    1) Нак акча — наличные;
+    2) Нак эмес — безналичные;
+    3) Улуттук банктын курсу — курс НБКР.
+
+    В текстовой версии HTML после заголовков идут строки:
+    Валюта Сатып алуу Сатуу
+    USD ...
+    EUR ...
+    RUB покупка продажа
+    KZT ...
+
+    Нам нужен второй банковский блок, то есть "Нак эмес",
+    и строка RUB, поле "Сатуу" / продажа.
+    """
+    try:
+        response = requests.get(
+            AIYL_BANK_URL,
+            timeout=20,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; KgsRubBot/1.0; "
+                    "+https://github.com/ninokovank-blip/kgs-rub-bot)"
+                )
+            },
+        )
+        response.raise_for_status()
+
+        if not response.encoding:
+            response.encoding = "utf-8"
+
+        html = response.text
+
+        # Убираем HTML-теги, чтобы работать с текстом примерно так же,
+        # как он виден в браузере/поисковом представлении.
+        text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.S | re.I)
+        text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+
+        # Ищем строку даты сайта, например 12.06.2026.
+        date_match = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
+        site_date = date_match.group(0) if date_match else "дата не найдена"
+
+        # На странице RUB встречается несколько раз:
+        # 1) наличный блок;
+        # 2) безналичный блок;
+        # 3) блок НБКР.
+        #
+        # Нам нужен второй банковский RUB, который идёт после второго заголовка
+        # "Валюта Сатып алуу Сатуу".
+        pattern = (
+            r"Валюта\s+Сатып\s+алуу\s+Сатуу"
+            r".*?RUB\s+([0-9]+(?:[.,][0-9]+)?)\s+([0-9]+(?:[.,][0-9]+)?)"
+        )
+
+        matches = re.findall(pattern, text, flags=re.S | re.I)
+
+        if len(matches) < 2:
+            return {
+                "ok": False,
+                "rate": None,
+                "buy_rate": None,
+                "sell_rate": None,
+                "date": site_date,
+                "error": (
+                    "Не удалось уверенно найти второй банковский блок курсов "
+                    "Айыл Банка для безналичных операций."
+                ),
+            }
+
+        cashless_buy_text, cashless_sell_text = matches[1]
+        cashless_buy = parse_rate_value(cashless_buy_text)
+        cashless_sell = parse_rate_value(cashless_sell_text)
+
+        if cashless_sell <= 0:
+            return {
+                "ok": False,
+                "rate": None,
+                "buy_rate": cashless_buy,
+                "sell_rate": cashless_sell,
+                "date": site_date,
+                "error": "Найденный курс продажи Айыл Банка некорректен.",
+            }
+
+        return {
+            "ok": True,
+            "rate": cashless_sell,
+            "buy_rate": cashless_buy,
+            "sell_rate": cashless_sell,
+            "date": site_date,
+            "error": None,
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "rate": None,
+            "buy_rate": None,
+            "sell_rate": None,
+            "date": None,
+            "error": f"Ошибка запроса к сайту Айыл Банка: {exc}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "rate": None,
+            "buy_rate": None,
+            "sell_rate": None,
+            "date": None,
+            "error": f"Неожиданная ошибка при получении курса Айыл Банка: {exc}",
+        }
+
+
 def get_rates() -> dict:
     """
     Единая функция получения курсов.
 
     Сейчас:
     - Бакай Банк: тестовый курс;
-    - Айыл Банк: тестовый курс;
+    - Айыл Банк: реальный курс с сайта;
     - НБКР: реальный официальный курс из XML.
-
-    Следующими этапами заменим Бакай и Айыл на реальные источники.
     """
     nbkr_data = get_nbkr_rub_rate()
+    aiyl_data = get_aiyl_cashless_rub_sell_rate()
 
     if nbkr_data["ok"]:
         nbkr_rate = nbkr_data["rate"]
@@ -158,14 +269,30 @@ def get_rates() -> dict:
         nbkr_rate = 1.2135
         nbkr_status = f"НБКР не получен, используется тестовый fallback. Причина: {nbkr_data['error']}"
 
+    if aiyl_data["ok"]:
+        aiyl_rate = aiyl_data["rate"]
+        aiyl_status = (
+            f"Айыл Банк получен с официального сайта, "
+            f"безналичная продажа RUB, дата сайта: {aiyl_data['date']}"
+        )
+    else:
+        aiyl_rate = 1.2300
+        aiyl_status = (
+            "Айыл Банк не получен, используется тестовый fallback. "
+            f"Причина: {aiyl_data['error']}"
+        )
+
     return {
+        # Бакай пока оставляем тестовым.
         "bakai": 1.2450,
-        "aiyl": 1.2300,
+        "aiyl": aiyl_rate,
         "nbkr": nbkr_rate,
         "source_status": (
-            "Бакай и Айыл — тестовые данные; "
+            "Бакай — тестовые данные; "
+            f"{aiyl_status}; "
             f"{nbkr_status}. "
-            "Не использовать для финансового решения до подключения банковских источников."
+            "Не использовать для финансового решения до подключения Бакай Банка "
+            "и финальной проверки банковских источников."
         ),
     }
 
@@ -201,10 +328,6 @@ def parse_amount_text(text: str) -> float | None:
 
 
 def get_best_bank_by_rate(rates: dict) -> dict:
-    """
-    Для покупки RUB за KGS выгоднее тот банк,
-    у которого ниже курс продажи RUB.
-    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
 
@@ -242,12 +365,6 @@ def get_best_bank_by_rate(rates: dict) -> dict:
 
 
 def calculate_purchase_cost(target_rub: float, rates: dict) -> dict:
-    """
-    Считает, сколько KGS потребуется для покупки заданной суммы RUB.
-
-    Формула:
-    стоимость в KGS = сумма RUB × курс продажи RUB
-    """
     bakai_rate = rates["bakai"]
     aiyl_rate = rates["aiyl"]
     nbkr_rate = rates["nbkr"]
@@ -377,8 +494,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/rates — показать текущие курсы и лучший банк сейчас\n"
         "/calc — открыть калькулятор покупки RUB\n"
         "/help — помощь\n\n"
-        "Сейчас Бакай и Айыл используются как тестовые данные, "
-        "а НБКР уже подтягивается из официального XML."
+        "Сейчас Бакай используется как тестовые данные, "
+        "Айыл и НБКР уже подтягиваются из официальных источников."
     )
 
     await update.message.reply_text(message, reply_markup=main_keyboard())
@@ -508,9 +625,6 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обрабатывает нажатия на кнопки-клавиатуру.
-    """
     text = update.message.text.strip()
 
     if text == "📊 Курсы сейчас":
@@ -566,7 +680,6 @@ def main() -> None:
     app.add_handler(CommandHandler("compare", buy))
     app.add_handler(CommandHandler("compare_now", buy))
 
-    # Обработка остальных кнопок и обычного текста
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_buttons))
 
     app.run_polling()

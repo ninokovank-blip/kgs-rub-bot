@@ -62,10 +62,6 @@ def parse_rate_value(text: str) -> float:
 
 
 def html_to_text(html: str) -> str:
-    """
-    Превращает HTML в простой текст.
-    Используется для Айыл Банка.
-    """
     text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.S | re.I)
     text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -153,20 +149,8 @@ def get_bakai_cashless_rub_sell_rate() -> dict:
     """
     Получает безналичный курс продажи RUB с официального сайта Бакай Банка.
 
-    По результатам проверки сайта:
-    данные лежат внутри Next.js stream-скрипта в HTML.
-
     Нужное поле:
     RUB -> non_cash -> sell
-
-    Пример структуры:
-    "RUB": {
-        "name": "Российский рубль",
-        "cash": {"buy": 1.19, "sell": 1.23},
-        "transfer": {"buy": 1.14, "sell": 1.24},
-        "nbkr": {"rate": 1.2135},
-        "non_cash": {"buy": 1.18, "sell": 1.24}
-    }
     """
     try:
         response = requests.get(
@@ -184,8 +168,6 @@ def get_bakai_cashless_rub_sell_rate() -> dict:
 
         html = response.text
 
-        # В HTML Next.js данные часто лежат в JS-строке с экранированными кавычками.
-        # Поэтому нормализуем их, чтобы проще искать JSON-подобные фрагменты.
         normalized = html.replace('\\"', '"')
         normalized = normalized.replace("\\/", "/")
 
@@ -276,9 +258,6 @@ def get_bakai_cashless_rub_sell_rate() -> dict:
 def get_aiyl_cashless_rub_sell_rate() -> dict:
     """
     Получает безналичный курс продажи RUB с официального сайта Айыл Банка / A-bank.
-
-    Текущая логика основана на HTML-тексте официального сайта.
-    Для MVP используем найденный ранее второй банковский блок курсов.
     """
     try:
         response = requests.get(
@@ -370,8 +349,8 @@ async def get_rates_async() -> dict:
     Единая функция получения курсов.
 
     Источники:
-    - Бакай Банк: официальный сайт, Next.js stream в HTML, RUB/non_cash/sell;
-    - Айыл Банк: официальный сайт;
+    - Бакай Банк: официальный сайт, RUB / безналичная продажа;
+    - Айыл Банк / A-bank: официальный сайт, RUB / безналичная продажа;
     - НБКР: официальный XML.
     """
     nbkr_data = get_nbkr_rub_rate()
@@ -380,34 +359,34 @@ async def get_rates_async() -> dict:
 
     if nbkr_data["ok"]:
         nbkr_rate = nbkr_data["rate"]
-        nbkr_status = f"НБКР получен из официального XML, дата курса: {nbkr_data['date']}"
+        nbkr_status = f"получен из официального XML НБКР, дата курса: {nbkr_data['date']}"
     else:
         nbkr_rate = DEFAULT_NBKR_FALLBACK
-        nbkr_status = f"НБКР не получен, используется тестовый fallback. Причина: {nbkr_data['error']}"
+        nbkr_status = f"не получен, используется резервный тестовый курс. Причина: {nbkr_data['error']}"
 
     if aiyl_data["ok"]:
         aiyl_rate = aiyl_data["rate"]
         aiyl_status = (
-            f"Айыл Банк получен с официального сайта, "
-            f"безналичная продажа RUB, дата сайта: {aiyl_data['date']}"
+            f"получен с официального сайта, тип курса: безналичная продажа RUB, "
+            f"дата на сайте: {aiyl_data['date']}"
         )
     else:
         aiyl_rate = DEFAULT_AIYL_FALLBACK
         aiyl_status = (
-            "Айыл Банк не получен, используется тестовый fallback. "
+            "не получен, используется резервный тестовый курс. "
             f"Причина: {aiyl_data['error']}"
         )
 
     if bakai_data["ok"]:
         bakai_rate = bakai_data["rate"]
         bakai_status = (
-            f"Бакай Банк получен с официального сайта, "
-            f"RUB / non_cash / sell, дата обновления: {bakai_data['date']}"
+            f"получен с официального сайта, тип курса: RUB / безналичная продажа, "
+            f"дата обновления на сайте: {bakai_data['date']}"
         )
     else:
         bakai_rate = DEFAULT_BAKAI_FALLBACK
         bakai_status = (
-            "Бакай Банк не получен, используется тестовый fallback. "
+            "не получен, используется резервный тестовый курс. "
             f"Причина: {bakai_data['error']}"
         )
 
@@ -416,10 +395,13 @@ async def get_rates_async() -> dict:
         "aiyl": aiyl_rate,
         "nbkr": nbkr_rate,
         "source_status": (
-            f"{bakai_status}; "
-            f"{aiyl_status}; "
-            f"{nbkr_status}. "
-            "Перед финансовым решением рекомендуется ручная сверка курса на сайтах банков."
+            "Статус источников:\n"
+            f"• Бакай Банк: {bakai_status}\n"
+            f"• Айыл Банк / A-bank: {aiyl_status}\n"
+            f"• НБКР: {nbkr_status}\n\n"
+            "Контрольное примечание:\n"
+            "перед проведением крупной конвертации рекомендуется сверить курс на сайтах банков "
+            "или подтвердить индивидуальный курс у банка."
         ),
     }
 
@@ -427,10 +409,6 @@ async def get_rates_async() -> dict:
 def parse_amount_text(text: str) -> float | None:
     """
     Распознаёт сумму RUB из текста.
-    Примеры:
-    250000000
-    250 000 000
-    250000000 RUB
     """
     if not text:
         return None
@@ -586,7 +564,8 @@ def build_calculator_message(result: dict, source_status: str) -> str:
     return (
         "Калькулятор покупки RUB за KGS\n"
         f"Дата и время: {now} Бишкек\n\n"
-        "Курсы RUB / KGS, безналичная продажа:\n"
+        "Тип курса: безналичная продажа RUB\n\n"
+        "Курсы RUB / KGS:\n"
         f"Бакай Банк: {format_rate(result['bakai_rate'])}\n"
         f"Айыл Банк / A-bank: {format_rate(result['aiyl_rate'])}\n"
         f"НБКР: {format_rate(result['nbkr_rate'])}\n\n"
@@ -612,7 +591,7 @@ def build_calculator_message(result: dict, source_status: str) -> str:
         f"{anomaly_text}\n\n"
         "Комментарий:\n"
         f"{comment}\n\n"
-        f"Статус данных: {source_status}"
+        f"{source_status}"
     )
 
 
@@ -628,15 +607,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
         "Здравствуйте!\n\n"
         "Я бот для мониторинга курсов RUB / KGS.\n\n"
+        "Что я показываю:\n"
+        "• текущие курсы Бакай Банка, Айыл Банка / A-bank и НБКР;\n"
+        "• какой банк выгоднее для покупки RUB за KGS;\n"
+        "• спред каждого банка к курсу НБКР;\n"
+        "• расчёт потребности в KGS для покупки заданной суммы RUB.\n\n"
         "Главная логика:\n"
-        "вы вводите, сколько RUB нужно купить, "
-        "а я считаю, сколько KGS потребуется через каждый банк.\n\n"
-        "Выберите действие кнопкой ниже или используйте команды:\n"
-        "/rates — показать текущие курсы и лучший банк сейчас\n"
+        "вы вводите, сколько RUB нужно купить, а я считаю, сколько KGS потребуется через каждый банк.\n\n"
+        "Доступные действия:\n"
+        "📊 Курсы сейчас — показать актуальные курсы и лучший банк на текущий момент\n"
+        "🧮 Калькулятор — рассчитать, сколько KGS потребуется для покупки нужной суммы RUB\n"
+        "❓ Помощь — посмотреть описание команд и логики расчёта\n\n"
+        "Команды:\n"
+        "/start — перезапустить бота и показать главное меню\n"
+        "/rates — показать текущие курсы\n"
         "/calc — открыть калькулятор покупки RUB\n"
-        "/help — помощь\n\n"
-        "Курсы банков подтягиваются с официальных сайтов. "
-        "НБКР подтягивается из официального XML."
+        "/help — помощь"
     )
 
     await update.message.reply_text(message, reply_markup=main_keyboard())
@@ -644,16 +630,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
-        "Помощь\n\n"
-        "Основные действия:\n"
-        "📊 Курсы сейчас — показать текущие курсы и лучший банк\n"
-        "🧮 Калькулятор — ввести сумму RUB и рассчитать потребность в KGS\n\n"
+        "Помощь по боту\n\n"
+        "Основные кнопки:\n\n"
+        "📊 Курсы сейчас\n"
+        "Показывает текущие курсы RUB / KGS по Бакай Банку, Айыл Банку / A-bank и НБКР. "
+        "Также бот сразу определяет, где сейчас выгоднее покупать RUB за KGS.\n\n"
+        "🧮 Калькулятор\n"
+        "Используется, когда нужно купить конкретную сумму RUB. "
+        "Вы вводите сумму RUB, а бот считает, сколько KGS потребуется через каждый банк.\n\n"
+        "❓ Помощь\n"
+        "Показывает описание кнопок, команд и логики расчёта.\n\n"
+        "Команды:\n"
+        "/start — открыть главное меню\n"
+        "/rates — показать текущие курсы и лучший банк сейчас\n"
+        "/calc — открыть калькулятор покупки RUB\n"
+        "/calc 1000000 — сразу рассчитать покупку 1 000 000 RUB\n"
+        "/help — показать эту справку\n\n"
         "Как пользоваться калькулятором:\n"
-        "1. Нажмите кнопку 🧮 Калькулятор или напишите /calc\n"
-        "2. Бот попросит ввести сумму RUB\n"
-        "3. Введите сумму, например: 250000000\n\n"
+        "1. Нажмите 🧮 Калькулятор или напишите /calc\n"
+        "2. Введите сумму RUB, которую нужно купить\n"
+        "3. Например: 1000000\n\n"
         "Важно:\n"
-        "вводимая сумма — это сумма RUB, которую нужно купить."
+        "для покупки RUB за KGS выгоднее тот банк, у которого ниже курс продажи RUB."
     )
 
     await update.message.reply_text(message, reply_markup=main_keyboard())
@@ -680,6 +678,7 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     message = (
         "Текущие курсы RUB / KGS\n"
+        "Тип курса: безналичная продажа RUB\n"
         f"Дата и время: {now} Бишкек\n\n"
         f"Бакай Банк: {format_rate(rates_data['bakai'])}\n"
         f"Айыл Банк / A-bank: {format_rate(rates_data['aiyl'])}\n"
@@ -695,7 +694,7 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{format_number(aiyl_spread_pct, 2)}%\n\n"
         "Комментарий:\n"
         f"{conclusion}\n\n"
-        f"Статус данных: {rates_data['source_status']}"
+        f"{rates_data['source_status']}"
     )
 
     await update.message.reply_text(message, reply_markup=main_keyboard())
@@ -715,7 +714,7 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Калькулятор покупки RUB за KGS\n\n"
         "Введите сумму RUB, которую нужно купить.\n\n"
         "Пример:\n"
-        "250000000\n\n"
+        "1000000\n\n"
         "Для отмены напишите /cancel.",
     )
 
@@ -729,7 +728,7 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "Не удалось распознать сумму.\n\n"
             "Введите только сумму RUB числом, например:\n"
-            "250000000\n\n"
+            "1000000\n\n"
             "Для отмены напишите /cancel."
         )
         return WAITING_FOR_RUB_AMOUNT
@@ -775,6 +774,8 @@ async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "курс сейчас",
         "текущие курсы",
         "какой банк выгоднее",
+        "сравни курс",
+        "сравни курс сейчас",
     ]:
         await rates(update, context)
         return

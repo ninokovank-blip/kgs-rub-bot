@@ -70,9 +70,27 @@ def html_to_text(html: str) -> str:
     return text.strip()
 
 
+def format_source_datetime(value: str | None) -> str:
+    """
+    Приводит техническую дату сайта к нормальному виду.
+
+    Пример:
+    2026-06-12T18:42:11.189063 -> 12.06.2026 18:42
+    """
+    if not value or value == "дата не найдена":
+        return "дата не найдена"
+
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return value
+
+
 def get_nbkr_rub_rate() -> dict:
     """
-    Получает официальный курс RUB/KGS из XML НБКР.
+    Получает официальный курс RUB/KGS с сайта НБКР.
+    Технически используется официальный XML-файл НБКР.
     """
     try:
         response = requests.get(NBKR_DAILY_XML_URL, timeout=15)
@@ -94,7 +112,7 @@ def get_nbkr_rub_rate() -> dict:
                         "ok": False,
                         "rate": None,
                         "date": xml_date,
-                        "error": "В XML НБКР найдена валюта RUB, но отсутствует Nominal или Value.",
+                        "error": "На сайте НБКР найдена валюта RUB, но отсутствует Nominal или Value.",
                     }
 
                 nominal = parse_rate_value(nominal_text)
@@ -105,7 +123,7 @@ def get_nbkr_rub_rate() -> dict:
                         "ok": False,
                         "rate": None,
                         "date": xml_date,
-                        "error": "В XML НБКР некорректный Nominal для RUB.",
+                        "error": "На сайте НБКР некорректный Nominal для RUB.",
                     }
 
                 return {
@@ -119,7 +137,7 @@ def get_nbkr_rub_rate() -> dict:
             "ok": False,
             "rate": None,
             "date": xml_date,
-            "error": "В XML НБКР не найдена валюта RUB.",
+            "error": "На сайте НБКР не найдена валюта RUB.",
         }
 
     except requests.RequestException as exc:
@@ -127,14 +145,14 @@ def get_nbkr_rub_rate() -> dict:
             "ok": False,
             "rate": None,
             "date": None,
-            "error": f"Ошибка запроса к НБКР: {exc}",
+            "error": f"Ошибка запроса к сайту НБКР: {exc}",
         }
     except ET.ParseError as exc:
         return {
             "ok": False,
             "rate": None,
             "date": None,
-            "error": f"Ошибка разбора XML НБКР: {exc}",
+            "error": f"Ошибка разбора данных НБКР: {exc}",
         }
     except Exception as exc:
         return {
@@ -196,7 +214,7 @@ def get_bakai_cashless_rub_sell_rate() -> dict:
                 "date": site_date,
                 "error": (
                     "Не удалось найти RUB -> non_cash -> sell "
-                    "в HTML-скриптах официального сайта Бакай Банка."
+                    "в данных официального сайта Бакай Банка."
                 ),
             }
 
@@ -351,7 +369,7 @@ async def get_rates_async() -> dict:
     Источники:
     - Бакай Банк: официальный сайт, RUB / безналичная продажа;
     - Айыл Банк / A-bank: официальный сайт, RUB / безналичная продажа;
-    - НБКР: официальный XML.
+    - НБКР: официальный сайт НБКР.
     """
     nbkr_data = get_nbkr_rub_rate()
     aiyl_data = get_aiyl_cashless_rub_sell_rate()
@@ -359,7 +377,7 @@ async def get_rates_async() -> dict:
 
     if nbkr_data["ok"]:
         nbkr_rate = nbkr_data["rate"]
-        nbkr_status = f"получен из официального XML НБКР, дата курса: {nbkr_data['date']}"
+        nbkr_status = f"получен с официального сайта НБКР, дата курса: {nbkr_data['date']}"
     else:
         nbkr_rate = DEFAULT_NBKR_FALLBACK
         nbkr_status = f"не получен, используется резервный тестовый курс. Причина: {nbkr_data['error']}"
@@ -379,9 +397,10 @@ async def get_rates_async() -> dict:
 
     if bakai_data["ok"]:
         bakai_rate = bakai_data["rate"]
+        bakai_date = format_source_datetime(bakai_data["date"])
         bakai_status = (
             f"получен с официального сайта, тип курса: RUB / безналичная продажа, "
-            f"дата обновления на сайте: {bakai_data['date']}"
+            f"дата обновления на сайте: {bakai_date}"
         )
     else:
         bakai_rate = DEFAULT_BAKAI_FALLBACK
@@ -398,10 +417,7 @@ async def get_rates_async() -> dict:
             "Статус источников:\n"
             f"• Бакай Банк: {bakai_status}\n"
             f"• Айыл Банк / A-bank: {aiyl_status}\n"
-            f"• НБКР: {nbkr_status}\n\n"
-            "Контрольное примечание:\n"
-            "перед проведением крупной конвертации рекомендуется сверить курс на сайтах банков "
-            "или подтвердить индивидуальный курс у банка."
+            f"• НБКР: {nbkr_status}"
         ),
     }
 
@@ -644,7 +660,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start — открыть главное меню\n"
         "/rates — показать текущие курсы и лучший банк сейчас\n"
         "/calc — открыть калькулятор покупки RUB\n"
-        "/calc 1000000 — сразу рассчитать покупку 1 000 000 RUB\n"
         "/help — показать эту справку\n\n"
         "Как пользоваться калькулятором:\n"
         "1. Нажмите 🧮 Калькулятор или напишите /calc\n"

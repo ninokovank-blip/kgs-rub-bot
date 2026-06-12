@@ -47,6 +47,23 @@ NOTIFICATION_HOURS = {7, 9, 11, 13, 15, 17}
 SENT_NOTIFICATION_KEYS = set()
 
 
+async def send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показывает пользователю статус, что бот печатает.
+    Полезно для операций, где бот получает курсы или синхронизируется с Google Sheets.
+    """
+    if not update.effective_chat:
+        return
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action="typing",
+        )
+    except Exception as exc:
+        logging.exception("Не удалось отправить typing action: %s", exc)
+
+
 def is_admin_chat_id(chat_id: int | None) -> bool:
     return chat_id == ADMIN_CHAT_ID
 
@@ -968,6 +985,8 @@ def parse_target_rub_from_command(context: ContextTypes.DEFAULT_TYPE) -> float |
 
 
 async def show_users_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+
     report = build_users_report()
 
     if len(report) <= 4000:
@@ -990,6 +1009,8 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=keyboard_for_update(update),
         )
         return
+
+    await send_typing(update, context)
 
     track_user(update, "users")
     await show_users_to_admin(update, context)
@@ -1065,6 +1086,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+
     track_user(update, "rates")
 
     rates_data = await get_rates_async()
@@ -1112,6 +1135,8 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await send_typing(update, context)
+
     track_user(update, "calc_start")
 
     target_rub = parse_target_rub_from_command(context)
@@ -1138,6 +1163,8 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await send_typing(update, context)
+
     track_user(update, "calc_amount_received")
 
     target_rub = parse_amount_text(update.message.text)
@@ -1163,6 +1190,8 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+
     chat_id = update.effective_chat.id
 
     already_subscribed = is_user_subscribed(chat_id)
@@ -1189,6 +1218,8 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+
     chat_id = update.effective_chat.id
 
     was_subscribed = is_user_subscribed(chat_id)
@@ -1213,6 +1244,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+
     track_user(update, "buy")
 
     target_rub = parse_target_rub_from_command(context)

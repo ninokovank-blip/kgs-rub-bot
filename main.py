@@ -1,5 +1,7 @@
 import os
 import re
+import shutil
+import asyncio
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -67,10 +69,29 @@ def html_to_text(html: str) -> str:
     return text.strip()
 
 
+def find_chromium_executable() -> str | None:
+    """
+    Ищем Chromium в Railway/Nixpacks.
+    """
+    env_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+    if env_path:
+        return env_path
+
+    candidates = [
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+    ]
+
+    for path in candidates:
+        if path:
+            return path
+
+    return None
+
+
 def get_nbkr_rub_rate() -> dict:
-    """
-    Получает официальный курс RUB/KGS из XML НБКР.
-    """
     try:
         response = requests.get(NBKR_DAILY_XML_URL, timeout=15)
         response.raise_for_status()
@@ -143,9 +164,6 @@ def get_nbkr_rub_rate() -> dict:
 
 
 def get_aiyl_cashless_rub_sell_rate() -> dict:
-    """
-    Получает безналичный курс продажи RUB с официального сайта Айыл Банка / A-bank.
-    """
     try:
         response = requests.get(
             AIYL_BANK_URL,
@@ -231,22 +249,6 @@ def get_aiyl_cashless_rub_sell_rate() -> dict:
 
 
 def extract_bakai_rub_sell_from_text(text: str) -> dict:
-    """
-    Извлекает безналичный курс продажи RUB из текста страницы Бакай Банка.
-
-    По проверке через document.body.innerText структура такая:
-
-    Курсы валют
-    Безналичные
-    ...
-    Покупка Продажа
-    87.000 87.500     -> USD
-    100.800 101.800   -> EUR
-    1.170 1.240       -> RUB
-    0.170 0.190       -> KZT
-
-    Нам нужна продажа RUB, то есть третья пара значений, второе число.
-    """
     normalized_text = re.sub(r"\s+", " ", text).strip()
 
     date_time_match = re.search(
@@ -318,22 +320,30 @@ def extract_bakai_rub_sell_from_text(text: str) -> dict:
 
 def get_bakai_cashless_rub_sell_rate() -> dict:
     """
-    Получает безналичный курс продажи RUB с официального сайта Бакай Банка.
+    Синхронная функция Playwright.
 
-    Используем Playwright, потому что обычный requests не видит блок курсов:
-    сайт отрисовывает курсы после выполнения JavaScript.
+    Важно:
+    Telegram-бот асинхронный, поэтому эту функцию нельзя вызывать напрямую
+    внутри async handler. Ниже мы вызываем её через asyncio.to_thread().
     """
     try:
+        chromium_path = find_chromium_executable()
+
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                executable_path=os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"),
-                args=[
+            launch_kwargs = {
+                "headless": True,
+                "args": [
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-setuid-sandbox",
                 ],
-            )
+            }
+
+            if chromium_path:
+                launch_kwargs["executable_path"] = chromium_path
+
+            browser = p.chromium.launch(**launch_kwargs)
 
             page = browser.new_page(
                 locale="ru-RU",
@@ -359,9 +369,7 @@ def get_bakai_cashless_rub_sell_rate() -> dict:
                     "error": "Playwright открыл сайт Бакай Банка, но не дождался блока 'Курсы валют'.",
                 }
 
-            # Дадим сайту немного времени дорисовать значения.
             page.wait_for_timeout(3000)
-
             text = page.evaluate("() => document.body.innerText")
 
             browser.close()
@@ -371,7 +379,6 @@ def get_bakai_cashless_rub_sell_rate() -> dict:
         if result["ok"]:
             return result
 
-        # Для диагностики добавим короткий фрагмент текста.
         short_text = text[:1000].replace("\n", " ")
         result["error"] = f"{result['error']} Фрагмент текста: {short_text}"
         return result
@@ -387,18 +394,16 @@ def get_bakai_cashless_rub_sell_rate() -> dict:
         }
 
 
-def get_rates() -> dict:
+async def get_rates_async() -> dict:
     """
     Единая функция получения курсов.
 
-    Сейчас:
-    - Бакай Банк: официальный сайт через Playwright;
-    - Айыл Банк: официальный сайт через requests;
-    - НБКР: официальный XML.
+    Бакай через Playwright запускаем в отдельном потоке,
+    чтобы не конфликтовать с async Telegram-ботом.
     """
     nbkr_data = get_nbkr_rub_rate()
     aiyl_data = get_aiyl_cashless_rub_sell_rate()
-    bakai_data = get_bakai_cashless_rub_sell_rate()
+    bakai_data = await asyncio.to_thread(get_bakai_cashless_rub_sell_rate)
 
     if nbkr_data["ok"]:
         nbkr_rate = nbkr_data["rate"]
@@ -668,7 +673,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    rates_data = get_rates()
+    rates_data = await get_rates_async()
     best_info = get_best_bank_by_rate(rates_data)
     now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
 
@@ -713,7 +718,7 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     target_rub = parse_target_rub_from_command(context)
 
     if target_rub is not None:
-        rates_data = get_rates()
+        rates_data = await get_rates_async()
         result = calculate_purchase_cost(target_rub, rates_data)
         message = build_calculator_message(result, rates_data["source_status"])
         await update.message.reply_text(message, reply_markup=main_keyboard())
@@ -742,7 +747,7 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return WAITING_FOR_RUB_AMOUNT
 
-    rates_data = get_rates()
+    rates_data = await get_rates_async()
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
@@ -766,7 +771,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    rates_data = get_rates()
+    rates_data = await get_rates_async()
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 

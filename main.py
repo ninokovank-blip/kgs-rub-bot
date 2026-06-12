@@ -40,6 +40,9 @@ USERS_FILE = "users.json"
 
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "439636200"))
 
+GOOGLE_APPS_SCRIPT_URL = os.getenv("GOOGLE_APPS_SCRIPT_URL", "")
+GOOGLE_APPS_SCRIPT_SECRET = os.getenv("GOOGLE_APPS_SCRIPT_SECRET", "kgs_rub_bot_secret_2026")
+
 NOTIFICATION_HOURS = {7, 9, 11, 13, 15, 17}
 SENT_NOTIFICATION_KEYS = set()
 
@@ -84,6 +87,14 @@ def parse_rate_value(text: str) -> float:
     return float(str(text).strip().replace(",", "."))
 
 
+def now_bishkek_str() -> str:
+    return datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def now_bishkek_short() -> str:
+    return datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
+
+
 def html_to_text(html: str) -> str:
     text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.S | re.I)
     text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
@@ -102,6 +113,50 @@ def format_source_datetime(value: str | None) -> str:
         return parsed.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return value
+
+
+def sync_to_google_sheets(payload: dict) -> None:
+    """
+    Отправляет событие в Google Apps Script.
+
+    Важно:
+    если Google Sheets временно недоступен, бот всё равно продолжает работать.
+    Ошибка только пишется в логи Railway.
+    """
+    if not GOOGLE_APPS_SCRIPT_URL:
+        return
+
+    try:
+        payload_with_secret = {
+            **payload,
+            "secret_token": GOOGLE_APPS_SCRIPT_SECRET,
+        }
+
+        response = requests.post(
+            GOOGLE_APPS_SCRIPT_URL,
+            json=payload_with_secret,
+            timeout=8,
+        )
+
+        if response.status_code >= 400:
+            logging.warning(
+                "Google Sheets sync HTTP error: status=%s, body=%s",
+                response.status_code,
+                response.text[:500],
+            )
+            return
+
+        try:
+            result = response.json()
+        except Exception:
+            logging.warning("Google Sheets sync returned non-json response: %s", response.text[:500])
+            return
+
+        if not result.get("ok"):
+            logging.warning("Google Sheets sync error: %s", result)
+
+    except Exception as exc:
+        logging.exception("Ошибка синхронизации с Google Sheets: %s", exc)
 
 
 def load_json_file(path: str, default_value):
@@ -175,26 +230,66 @@ def track_user(update: Update, action: str) -> None:
     chat_id = update.effective_chat.id
     user = update.effective_user
 
-    now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    now = now_bishkek_str()
     data = load_users()
     users = data.setdefault("users", {})
 
     key = str(chat_id)
     existing = users.get(key, {})
 
+    actions_count = int(existing.get("actions_count", 0)) + 1
+    first_seen = existing.get("first_seen", now)
+    is_subscribed = chat_id in load_subscribers()
+
     users[key] = {
         "chat_id": chat_id,
         "username": user.username or "",
         "first_name": user.first_name or "",
         "last_name": user.last_name or "",
-        "first_seen": existing.get("first_seen", now),
+        "first_seen": first_seen,
         "last_seen": now,
-        "actions_count": int(existing.get("actions_count", 0)) + 1,
+        "actions_count": actions_count,
         "last_action": action,
     }
 
     data["updated_at"] = datetime.now(BISHKEK_TZ).isoformat()
     save_users(data)
+
+    sync_to_google_sheets(
+        {
+            "event_type": "user_activity",
+            "datetime_bishkek": now,
+            "chat_id": chat_id,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or "",
+            "first_seen": first_seen,
+            "last_seen": now,
+            "actions_count": actions_count,
+            "last_action": action,
+            "is_subscribed": is_subscribed,
+        }
+    )
+
+
+def sync_subscriber_update(update: Update, is_active: bool) -> None:
+    if not update.effective_chat or not update.effective_user:
+        return
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    sync_to_google_sheets(
+        {
+            "event_type": "subscriber_update",
+            "datetime_bishkek": now_bishkek_str(),
+            "chat_id": chat_id,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or "",
+            "is_active": is_active,
+        }
+    )
 
 
 def is_admin(update: Update) -> bool:
@@ -635,8 +730,36 @@ def calculate_purchase_cost(target_rub: float, rates: dict) -> dict:
     }
 
 
+def sync_rates_log_to_google(source_type: str, rates_data: dict) -> None:
+    best_info = get_best_bank_by_rate(rates_data)
+
+    bakai_spread_abs = rates_data["bakai"] - rates_data["nbkr"]
+    aiyl_spread_abs = rates_data["aiyl"] - rates_data["nbkr"]
+
+    bakai_spread_pct = ((rates_data["bakai"] / rates_data["nbkr"]) - 1) * 100
+    aiyl_spread_pct = ((rates_data["aiyl"] / rates_data["nbkr"]) - 1) * 100
+
+    sync_to_google_sheets(
+        {
+            "event_type": "rates_log",
+            "datetime_bishkek": now_bishkek_str(),
+            "source_type": source_type,
+            "bakai_rate": rates_data["bakai"],
+            "aiyl_rate": rates_data["aiyl"],
+            "nbkr_rate": rates_data["nbkr"],
+            "best_bank": best_info["best_bank"],
+            "bank_difference_abs": best_info["absolute_difference"],
+            "bank_difference_pct": best_info["percent_difference"],
+            "bakai_spread_abs": bakai_spread_abs,
+            "bakai_spread_pct": bakai_spread_pct,
+            "aiyl_spread_abs": aiyl_spread_abs,
+            "aiyl_spread_pct": aiyl_spread_pct,
+        }
+    )
+
+
 def build_calculator_message(result: dict, source_status: str) -> str:
-    now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
+    now = now_bishkek_short()
 
     if result["best_bank"] == "Курсы равны":
         comment = "Курсы банков равны. Существенной разницы для выбора банка нет."
@@ -699,7 +822,7 @@ def build_calculator_message(result: dict, source_status: str) -> str:
 
 def build_notification_message(rates_data: dict) -> str:
     best_info = get_best_bank_by_rate(rates_data)
-    now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
+    now = now_bishkek_short()
 
     bakai_spread_abs = rates_data["bakai"] - rates_data["nbkr"]
     aiyl_spread_abs = rates_data["aiyl"] - rates_data["nbkr"]
@@ -893,8 +1016,10 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     track_user(update, "rates")
 
     rates_data = await get_rates_async()
+    sync_rates_log_to_google("manual_rates", rates_data)
+
     best_info = get_best_bank_by_rate(rates_data)
-    now = datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
+    now = now_bishkek_short()
 
     if best_info["best_bank"] == "Курсы равны":
         conclusion = "Курсы банков равны. Существенной разницы сейчас нет."
@@ -941,6 +1066,8 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if target_rub is not None:
         rates_data = await get_rates_async()
+        sync_rates_log_to_google("calculator_command", rates_data)
+
         result = calculate_purchase_cost(target_rub, rates_data)
         message = build_calculator_message(result, rates_data["source_status"])
         await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
@@ -974,6 +1101,8 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
         return WAITING_FOR_RUB_AMOUNT
 
     rates_data = await get_rates_async()
+    sync_rates_log_to_google("calculator", rates_data)
+
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
@@ -982,10 +1111,11 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    track_user(update, "subscribe")
-
     chat_id = update.effective_chat.id
     added = add_subscriber(chat_id)
+
+    track_user(update, "subscribe")
+    sync_subscriber_update(update, True)
 
     if added:
         message = (
@@ -1005,10 +1135,11 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    track_user(update, "unsubscribe")
-
     chat_id = update.effective_chat.id
     removed = remove_subscriber(chat_id)
+
+    track_user(update, "unsubscribe")
+    sync_subscriber_update(update, False)
 
     if removed:
         message = "Готово, рассылка отключена."
@@ -1039,6 +1170,8 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     rates_data = await get_rates_async()
+    sync_rates_log_to_google("buy_command", rates_data)
+
     result = calculate_purchase_cost(target_rub, rates_data)
     message = build_calculator_message(result, rates_data["source_status"])
 
@@ -1070,6 +1203,8 @@ async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     rates_data = await get_rates_async()
+    sync_rates_log_to_google("scheduled_notification", rates_data)
+
     message = build_notification_message(rates_data)
 
     for chat_id in subscribers:

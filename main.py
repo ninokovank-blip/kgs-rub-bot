@@ -389,10 +389,35 @@ def track_user(update: Update, action: str) -> None:
 
 
 # =========================
-# ПАРСЕРЫ ТЕКУЩИХ КУРСОВ
+# НБКР
 # =========================
 
-def get_nbkr_rate_for_date(date_obj: Optional[datetime] = None) -> Tuple[Optional[float], str]:
+def parse_nbkr_report_date(root: ET.Element) -> Optional[datetime]:
+    """
+    НБКР в XML обычно отдаёт дату отчёта в атрибуте Date.
+    Нам важно понимать, за какую дату реально пришёл курс.
+    """
+    for attr_name in ("Date", "date"):
+        raw_date = root.attrib.get(attr_name)
+        if raw_date:
+            for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(raw_date, fmt).replace(tzinfo=BISHKEK_TZ)
+                except Exception:
+                    continue
+
+    return None
+
+
+def get_nbkr_rate_with_actual_date(
+    date_obj: Optional[datetime] = None,
+) -> Tuple[Optional[float], str, Optional[datetime]]:
+    """
+    Возвращает:
+    1. курс RUB/KGS по НБКР;
+    2. текст источника;
+    3. фактическую дату курса, которую вернул НБКР.
+    """
     if date_obj is None:
         url = "https://www.nbkr.kg/XML/daily.xml"
     else:
@@ -404,26 +429,74 @@ def get_nbkr_rate_for_date(date_obj: Optional[datetime] = None) -> Tuple[Optiona
         response.raise_for_status()
     except Exception as exc:
         logging.exception("Ошибка получения курса НБКР: %s", exc)
-        return None, "НБКР: не удалось получить данные"
+        return None, "НБКР: не удалось получить данные", None
 
     try:
         root = ET.fromstring(response.content)
     except Exception as exc:
         logging.exception("Ошибка разбора XML НБКР: %s", exc)
-        return None, "НБКР: не удалось разобрать данные"
+        return None, "НБКР: не удалось разобрать данные", None
+
+    actual_date = parse_nbkr_report_date(root)
 
     for currency in root.findall(".//Currency"):
         if currency.attrib.get("ISOCode") == "RUB":
             nominal = parse_float(currency.findtext("Nominal")) or 1
             value = parse_float(currency.findtext("Value"))
+
             if value is None:
-                return None, "НБКР: курс RUB не найден"
+                return None, "НБКР: курс RUB не найден", actual_date
 
             rate = value / nominal
-            return rate, "НБКР: получен с официального сайта НБКР"
 
-    return None, "НБКР: курс RUB не найден"
+            if actual_date:
+                source = (
+                    "НБКР: получен с официального сайта НБКР, "
+                    f"дата курса: {actual_date.strftime('%d.%m.%Y')}"
+                )
+            else:
+                source = "НБКР: получен с официального сайта НБКР"
 
+            return rate, source, actual_date
+
+    return None, "НБКР: курс RUB не найден", actual_date
+
+
+def get_nbkr_rate_for_date(date_obj: Optional[datetime] = None) -> Tuple[Optional[float], str]:
+    """
+    Совместимость со старой логикой текущих курсов.
+    """
+    rate, source, _actual_date = get_nbkr_rate_with_actual_date(date_obj)
+    return rate, source
+
+
+def get_nbkr_rate_for_history_date(
+    target_date: datetime,
+) -> Tuple[Optional[float], Optional[datetime]]:
+    """
+    Для истории берём курс НБКР на дату.
+    Если на дату нет курса из-за выходного/праздника, берём ближайший предыдущий доступный курс.
+    """
+    for days_back in range(0, 10):
+        request_date = target_date - timedelta(days=days_back)
+
+        rate, _source, actual_date = get_nbkr_rate_with_actual_date(request_date)
+
+        if not rate:
+            continue
+
+        if actual_date is None:
+            return rate, request_date
+
+        if actual_date.date() <= target_date.date():
+            return rate, actual_date
+
+    return None, None
+
+
+# =========================
+# ПАРСЕРЫ ТЕКУЩИХ КУРСОВ
+# =========================
 
 def get_bakai_rate() -> Tuple[Optional[float], str]:
     url = "https://bakai.kg/"
@@ -867,14 +940,28 @@ def build_bank_selection_message() -> str:
     return "\n".join(lines)
 
 
-def get_nbkr_history_rates(start: datetime, end: datetime) -> Dict[Any, float]:
+def get_nbkr_history_rates(start: datetime, end: datetime) -> Dict[Any, Dict[str, Any]]:
+    """
+    Возвращает словарь:
+    {
+        date: {
+            "rate": 1.0732,
+            "actual_date": date(...)
+        }
+    }
+    """
     result = {}
     current = start
 
     while current.date() <= end.date():
-        rate, _ = get_nbkr_rate_for_date(current)
+        rate, actual_date = get_nbkr_rate_for_history_date(current)
+
         if rate:
-            result[current.date()] = rate
+            result[current.date()] = {
+                "rate": rate,
+                "actual_date": actual_date.date() if actual_date else current.date(),
+            }
+
         current += timedelta(days=1)
 
     return result
@@ -884,7 +971,7 @@ def calculate_bank_history_summary(
     bank_name: str,
     organization_id: int,
     sell_points: List[Dict[str, Any]],
-    nbkr_rates_by_date: Dict[Any, float],
+    nbkr_rates_by_date: Dict[Any, Dict[str, Any]],
     start: datetime,
     end: datetime,
 ) -> Optional[Dict[str, Any]]:
@@ -898,11 +985,27 @@ def calculate_bank_history_summary(
 
     rates = [point["rate"] for point in filtered]
     spreads = []
+    nbkr_rates_used = []
+    negative_spread_points = 0
 
     for point in filtered:
-        nbkr_rate = nbkr_rates_by_date.get(point["date"])
-        if nbkr_rate:
-            spreads.append((point["rate"] / nbkr_rate - 1) * 100)
+        nbkr_item = nbkr_rates_by_date.get(point["date"])
+
+        if not nbkr_item:
+            continue
+
+        nbkr_rate = nbkr_item.get("rate")
+
+        if not nbkr_rate:
+            continue
+
+        nbkr_rates_used.append(nbkr_rate)
+
+        spread_pct = (point["rate"] / nbkr_rate - 1) * 100
+        spreads.append(spread_pct)
+
+        if spread_pct < 0:
+            negative_spread_points += 1
 
     last_point = max(filtered, key=lambda x: x["datetime"])
 
@@ -913,9 +1016,13 @@ def calculate_bank_history_summary(
         "min_sell_rate": min(rates),
         "max_sell_rate": max(rates),
         "last_sell_rate": last_point["rate"],
+        "avg_nbkr_rate": mean(nbkr_rates_used) if nbkr_rates_used else None,
+        "min_nbkr_rate": min(nbkr_rates_used) if nbkr_rates_used else None,
+        "max_nbkr_rate": max(nbkr_rates_used) if nbkr_rates_used else None,
         "avg_spread_pct": mean(spreads) if spreads else None,
         "min_spread_pct": min(spreads) if spreads else None,
         "max_spread_pct": max(spreads) if spreads else None,
+        "negative_spread_points": negative_spread_points,
         "rate_points_count": len(filtered),
     }
 
@@ -970,6 +1077,19 @@ def build_history_message(
     lines.extend(build_top_lines(summaries, "max_sell_rate", reverse=True, value_formatter=fmt_rate, limit=5))
     lines.append("")
 
+    nbkr_values = [
+        item.get("avg_nbkr_rate")
+        for item in summaries
+        if item.get("avg_nbkr_rate") is not None
+    ]
+
+    if nbkr_values:
+        lines.append("НБКР за период:")
+        lines.append(f"средний: {fmt_rate(mean(nbkr_values))}")
+        lines.append(f"минимум: {fmt_rate(min(nbkr_values))}")
+        lines.append(f"максимум: {fmt_rate(max(nbkr_values))}")
+        lines.append("")
+
     lines.append("Средний спред к НБКР:")
     spread_lines = build_top_lines(summaries, "avg_spread_pct", reverse=False, value_formatter=fmt_pct, limit=5)
     if spread_lines:
@@ -993,6 +1113,10 @@ def build_history_message(
             f"средний спред к НБКР: {fmt_pct(item['avg_spread_pct'])} / "
             f"изменений: {item['rate_points_count']}"
         )
+
+        if item.get("negative_spread_points", 0) > 0:
+            lines.append(f"аномалий ниже НБКР: {item['negative_spread_points']}")
+
         lines.append("")
 
     if no_data_banks:
@@ -1049,18 +1173,30 @@ def build_history_message(
     lines_short.extend(build_top_lines(summaries, "max_sell_rate", reverse=True, value_formatter=fmt_rate, limit=5))
     lines_short.append("")
 
+    if nbkr_values:
+        lines_short.append("НБКР за период:")
+        lines_short.append(f"средний: {fmt_rate(mean(nbkr_values))}")
+        lines_short.append(f"минимум: {fmt_rate(min(nbkr_values))}")
+        lines_short.append(f"максимум: {fmt_rate(max(nbkr_values))}")
+        lines_short.append("")
+
     lines_short.append("Средний спред к НБКР:")
     lines_short.extend(spread_lines if spread_lines else ["н/д"])
     lines_short.append("")
 
     lines_short.append("Краткая детализация по банкам:")
     for index, item in enumerate(sorted_by_avg[:10], start=1):
+        extra = ""
+        if item.get("negative_spread_points", 0) > 0:
+            extra = f", аномалий ниже НБКР: {item['negative_spread_points']}"
+
         lines_short.append(
             f"{index}. {item['bank_name']}: "
             f"средний {fmt_rate(item['avg_sell_rate'])}, "
             f"min {fmt_rate(item['min_sell_rate'])}, "
             f"max {fmt_rate(item['max_sell_rate'])}, "
             f"спред {fmt_pct(item['avg_spread_pct'])}"
+            f"{extra}"
         )
 
     if no_data_banks:
@@ -1201,10 +1337,20 @@ def build_single_bank_history_message(
     lines.append(f"изменений курса: {selected_summary['rate_points_count']}")
     lines.append("")
 
+    lines.append("НБКР за период:")
+    lines.append(f"средний: {fmt_rate(selected_summary['avg_nbkr_rate'])}")
+    lines.append(f"минимум: {fmt_rate(selected_summary['min_nbkr_rate'])}")
+    lines.append(f"максимум: {fmt_rate(selected_summary['max_nbkr_rate'])}")
+    lines.append("")
+
     lines.append("Спред к НБКР:")
     lines.append(f"средний: {fmt_pct(selected_summary['avg_spread_pct'])}")
     lines.append(f"минимальный: {fmt_pct(selected_summary['min_spread_pct'])}")
     lines.append(f"максимальный: {fmt_pct(selected_summary['max_spread_pct'])}")
+
+    if selected_summary.get("negative_spread_points", 0) > 0:
+        lines.append(f"аномалий ниже НБКР: {selected_summary['negative_spread_points']}")
+
     lines.append("")
 
     if total_banks:
@@ -1226,6 +1372,9 @@ def build_single_bank_history_message(
 
     if rank_avg and total_banks:
         comment += f" По среднему курсу банк занял {rank_avg} место из {total_banks}."
+
+    if selected_summary.get("negative_spread_points", 0) > 0:
+        comment += " Есть точки ниже НБКР, их нужно проверить как возможную аномалию источника или сопоставления дат."
 
     comment += " Данные приведены для анализа рынка."
 
@@ -1282,7 +1431,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🏦 История по банку\n"
         "Позволяет выбрать конкретный банк и посмотреть его исторический курс за дату или период. "
         "Бот показывает средний, минимальный, максимальный и последний курс, "
-        "спред к НБКР, а также место банка среди остальных банков за выбранный период.\n\n"
+        "курс НБКР за период, спред к НБКР, а также место банка среди остальных банков.\n\n"
         "Примеры периода для истории:\n"
         "12.06.2026\n"
         "01.06.2026-12.06.2026\n"

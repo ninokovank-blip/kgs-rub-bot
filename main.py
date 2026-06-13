@@ -1,57 +1,160 @@
-import os
-import re
 import json
 import logging
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import os
+import re
+from datetime import datetime, timedelta, timezone
+from statistics import mean
+from typing import Any, Dict, List, Optional, Tuple
+from xml.etree import ElementTree as ET
 
 import requests
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import ReplyKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
 
+# =========================
+# БАЗОВЫЕ НАСТРОЙКИ
+# =========================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-
-BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
-WAITING_FOR_RUB_AMOUNT = 1
-
-NBKR_DAILY_XML_URL = "https://www.nbkr.kg/XML/daily.xml"
-AIYL_BANK_URL = "https://abank.kg/ky"
-BAKAI_BANK_URL = "https://bakai.kg/"
-
-DEFAULT_BAKAI_FALLBACK = 1.2450
-DEFAULT_AIYL_FALLBACK = 1.2300
-DEFAULT_NBKR_FALLBACK = 1.2135
-
-SUBSCRIBERS_FILE = "subscribers.json"
-USERS_FILE = "users.json"
-
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "439636200"))
 
-GOOGLE_APPS_SCRIPT_URL = os.getenv("GOOGLE_APPS_SCRIPT_URL", "")
-GOOGLE_APPS_SCRIPT_SECRET = os.getenv("GOOGLE_APPS_SCRIPT_SECRET", "kgs_rub_bot_secret_2026")
+GOOGLE_APPS_SCRIPT_URL = os.getenv("GOOGLE_APPS_SCRIPT_URL", "").strip()
+GOOGLE_APPS_SCRIPT_SECRET = os.getenv("GOOGLE_APPS_SCRIPT_SECRET", "").strip()
 
-NOTIFICATION_HOURS = {7, 9, 11, 13, 15, 17}
+BISHKEK_TZ = timezone(timedelta(hours=6))
+
+SUBSCRIBERS_FILE = "subscribers.json"
+
+SCHEDULE_HOURS_BISHKEK = {7, 9, 11, 13, 15, 17}
 SENT_NOTIFICATION_KEYS = set()
+
+MAX_HISTORY_DAYS = 90
+
+# =========================
+# СПРАВОЧНИК БАНКОВ ДЛЯ ИСТОРИИ
+# =========================
+
+HISTORY_BANKS = [
+    {"id": 1, "name": "Элдик банк"},
+    {"id": 2, "name": "Оптима Банк"},
+    {"id": 3, "name": "КИКБ"},
+    {"id": 4, "name": "Керемет Банк"},
+    {"id": 5, "name": "MBANK"},
+    {"id": 6, "name": "Демир банк"},
+    {"id": 7, "name": "Банк Азии"},
+    {"id": 8, "name": "Кыргызкоммерцбанк"},
+    {"id": 9, "name": "Банк Компаньон"},
+    {"id": 10, "name": 'Банк "Бай Тушум"'},
+    {"id": 12, "name": "АБанк"},
+    {"id": 13, "name": "O!Bank"},
+    {"id": 14, "name": "Бакай Банк"},
+    {"id": 15, "name": "Толубай Банк"},
+    {"id": 16, "name": "Дос-Кредобанк"},
+    {"id": 18, "name": "ФИНКА Банк"},
+    {"id": 19, "name": "Капитал Банк"},
+    {"id": 20, "name": "Коммерческий Банк КСБ"},
+    {"id": 21, "name": "Евразийский Сберегательный Банк"},
+    {"id": 22, "name": "ФинансКредитБанк"},
+]
+
+# =========================
+# КНОПКИ
+# =========================
+
+BTN_RATES = "📊 Курсы сейчас"
+BTN_CALC = "🧮 Калькулятор"
+BTN_HISTORY = "📈 История курсов"
+BTN_SUBSCRIBE = "🔔 Подписаться на рассылку"
+BTN_UNSUBSCRIBE = "🔕 Отписаться"
+BTN_HELP = "❓ Помощь"
+BTN_USERS = "👥 Пользователи"
+
+
+def main_keyboard(chat_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_RATES, BTN_CALC],
+        [BTN_HISTORY],
+        [BTN_SUBSCRIBE, BTN_UNSUBSCRIBE],
+        [BTN_HELP],
+    ]
+
+    if chat_id == ADMIN_CHAT_ID:
+        rows.append([BTN_USERS])
+
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+# =========================
+# ОБЩИЕ УТИЛИТЫ
+# =========================
+
+def now_bishkek() -> datetime:
+    return datetime.now(BISHKEK_TZ)
+
+
+def format_dt_bishkek(dt: Optional[datetime] = None) -> str:
+    dt = dt or now_bishkek()
+    return dt.strftime("%d.%m.%Y %H:%M:%S")
+
+
+def format_date(dt: datetime) -> str:
+    return dt.strftime("%d.%m.%Y")
+
+
+def parse_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    text = text.replace("\xa0", " ").replace(" ", "").replace(",", ".")
+
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def fmt_rate(value: Optional[float]) -> str:
+    if value is None:
+        return "н/д"
+    return f"{value:.4f}"
+
+
+def fmt_pct(value: Optional[float]) -> str:
+    if value is None:
+        return "н/д"
+    return f"{value:.2f}%"
+
+
+def fmt_money(value: Optional[float]) -> str:
+    if value is None:
+        return "н/д"
+    return f"{value:,.2f}".replace(",", " ")
 
 
 async def send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Показывает пользователю статус, что бот печатает.
-    Полезно для операций, где бот получает курсы или синхронизируется с Google Sheets.
-    """
     if not update.effective_chat:
         return
 
@@ -64,226 +167,210 @@ async def send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logging.exception("Не удалось отправить typing action: %s", exc)
 
 
-def is_admin_chat_id(chat_id: int | None) -> bool:
-    return chat_id == ADMIN_CHAT_ID
+# =========================
+# GOOGLE SHEETS СИНХРОНИЗАЦИЯ
+# =========================
 
-
-def main_keyboard(chat_id: int | None = None) -> ReplyKeyboardMarkup:
-    keyboard = [
-        [KeyboardButton("📊 Курсы сейчас"), KeyboardButton("🧮 Калькулятор")],
-        [KeyboardButton("🔔 Подписаться на рассылку"), KeyboardButton("🔕 Отписаться")],
-    ]
-
-    if is_admin_chat_id(chat_id):
-        keyboard.append([KeyboardButton("👥 Пользователи"), KeyboardButton("❓ Помощь")])
-    else:
-        keyboard.append([KeyboardButton("❓ Помощь")])
-
-    return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True,
-        one_time_keyboard=False,
-        input_field_placeholder="Выберите действие или введите команду",
-    )
-
-
-def keyboard_for_update(update: Update) -> ReplyKeyboardMarkup:
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    return main_keyboard(chat_id)
-
-
-def format_number(value: float, digits: int = 2) -> str:
-    return f"{value:,.{digits}f}".replace(",", " ")
-
-
-def format_rate(value: float) -> str:
-    return f"{value:.4f}"
-
-
-def parse_rate_value(text: str) -> float:
-    return float(str(text).strip().replace(",", "."))
-
-
-def now_bishkek_str() -> str:
-    return datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M:%S")
-
-
-def now_bishkek_short() -> str:
-    return datetime.now(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
-
-
-def html_to_text(html: str) -> str:
-    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.S | re.I)
-    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&nbsp;", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def format_source_datetime(value: str | None) -> str:
-    if not value or value == "дата не найдена":
-        return "дата не найдена"
-
-    try:
-        parsed = datetime.fromisoformat(value)
-        return parsed.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return value
-
-
-def sync_to_google_sheets(payload: dict) -> dict | None:
-    """
-    Отправляет событие в Google Apps Script.
-
-    Если Google Sheets временно недоступен, бот продолжает работать.
-    Возвращает ответ Google Apps Script или None при ошибке.
-    """
-    if not GOOGLE_APPS_SCRIPT_URL:
+def post_to_google(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not GOOGLE_APPS_SCRIPT_URL or not GOOGLE_APPS_SCRIPT_SECRET:
         return None
 
-    try:
-        payload_with_secret = {
-            **payload,
-            "secret_token": GOOGLE_APPS_SCRIPT_SECRET,
-        }
+    payload = dict(payload)
+    payload["secret_token"] = GOOGLE_APPS_SCRIPT_SECRET
 
+    try:
         response = requests.post(
             GOOGLE_APPS_SCRIPT_URL,
-            json=payload_with_secret,
-            timeout=8,
+            json=payload,
+            timeout=12,
         )
-
-        if response.status_code >= 400:
-            logging.warning(
-                "Google Sheets sync HTTP error: status=%s, body=%s",
-                response.status_code,
-                response.text[:500],
-            )
-            return None
-
-        try:
-            result = response.json()
-        except Exception:
-            logging.warning("Google Sheets sync returned non-json response: %s", response.text[:500])
-            return None
-
-        if not result.get("ok"):
-            logging.warning("Google Sheets sync error: %s", result)
-
-        return result
-
     except Exception as exc:
-        logging.exception("Ошибка синхронизации с Google Sheets: %s", exc)
+        logging.exception("Google Sheets sync error: %s", exc)
         return None
 
-
-def load_json_file(path: str, default_value):
-    if not os.path.exists(path):
-        return default_value
-
-    try:
-        with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except Exception as exc:
-        logging.exception("Ошибка чтения файла %s: %s", path, exc)
-        return default_value
-
-
-def save_json_file(path: str, data) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        logging.exception("Ошибка сохранения файла %s: %s", path, exc)
-
-
-def load_subscribers() -> set[int]:
-    data = load_json_file(SUBSCRIBERS_FILE, {"chat_ids": []})
-    chat_ids = data.get("chat_ids", [])
-    return {int(chat_id) for chat_id in chat_ids}
-
-
-def save_subscribers(subscribers: set[int]) -> None:
-    data = {
-        "chat_ids": sorted(list(subscribers)),
-        "updated_at": datetime.now(BISHKEK_TZ).isoformat(),
-    }
-    save_json_file(SUBSCRIBERS_FILE, data)
-
-
-def add_subscriber(chat_id: int) -> bool:
-    subscribers = load_subscribers()
-
-    if chat_id in subscribers:
-        return False
-
-    subscribers.add(chat_id)
-    save_subscribers(subscribers)
-    return True
-
-
-def remove_subscriber(chat_id: int) -> bool:
-    subscribers = load_subscribers()
-
-    if chat_id not in subscribers:
-        return False
-
-    subscribers.remove(chat_id)
-    save_subscribers(subscribers)
-    return True
-
-
-def load_users() -> dict:
-    return load_json_file(USERS_FILE, {"users": {}})
-
-
-def save_users(data: dict) -> None:
-    save_json_file(USERS_FILE, data)
-
-
-def get_active_subscribers_from_google() -> set[int] | None:
-    """
-    Получает активных подписчиков из Google Sheets.
-
-    Возвращает:
-    - set(chat_id), если Google Sheets ответил успешно;
-    - None, если Google Sheets недоступен или вернул ошибку.
-
-    Пустой set означает, что активных подписчиков реально нет.
-    None означает техническую ошибку, тогда используем резервный subscribers.json.
-    """
-    result = sync_to_google_sheets(
-        {
-            "event_type": "get_active_subscribers",
-        }
-    )
-
-    if not result or not result.get("ok"):
+    if response.status_code != 200:
+        logging.error(
+            "Google Sheets sync HTTP error: %s %s",
+            response.status_code,
+            response.text[:500],
+        )
         return None
 
-    raw_chat_ids = result.get("active_chat_ids", [])
+    try:
+        data = response.json()
+    except Exception:
+        logging.error(
+            "Google Sheets sync returned non-json response: %s",
+            response.text[:500],
+        )
+        return None
 
-    active_subscribers = set()
+    if not data.get("ok"):
+        logging.error("Google Sheets sync returned error: %s", data)
 
-    for chat_id in raw_chat_ids:
+    return data
+
+
+def sync_user_activity(update: Update, action: str, is_subscribed: bool = False) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not user or not chat:
+        return
+
+    post_to_google({
+        "event_type": "user_activity",
+        "chat_id": chat.id,
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "datetime_bishkek": format_dt_bishkek(),
+        "last_seen": format_dt_bishkek(),
+        "last_action": action,
+        "actions_count": 1,
+        "is_subscribed": is_subscribed,
+    })
+
+
+def sync_rates_log(
+    source_type: str,
+    bakai_rate: Optional[float],
+    aiyl_rate: Optional[float],
+    nbkr_rate: Optional[float],
+) -> None:
+    best_bank = ""
+    bank_difference_abs = None
+    bank_difference_pct = None
+
+    bank_rates = []
+    if bakai_rate:
+        bank_rates.append(("Бакай Банк", bakai_rate))
+    if aiyl_rate:
+        bank_rates.append(("Айыл Банк / A-bank", aiyl_rate))
+
+    if bank_rates:
+        best_bank, best_rate = min(bank_rates, key=lambda x: x[1])
+        if len(bank_rates) >= 2:
+            rates_only = [x[1] for x in bank_rates]
+            bank_difference_abs = max(rates_only) - min(rates_only)
+            bank_difference_pct = bank_difference_abs / min(rates_only) * 100
+
+    bakai_spread_abs = None
+    bakai_spread_pct = None
+    aiyl_spread_abs = None
+    aiyl_spread_pct = None
+
+    if nbkr_rate:
+        if bakai_rate:
+            bakai_spread_abs = bakai_rate - nbkr_rate
+            bakai_spread_pct = (bakai_rate / nbkr_rate - 1) * 100
+        if aiyl_rate:
+            aiyl_spread_abs = aiyl_rate - nbkr_rate
+            aiyl_spread_pct = (aiyl_rate / nbkr_rate - 1) * 100
+
+    post_to_google({
+        "event_type": "rates_log",
+        "datetime_bishkek": format_dt_bishkek(),
+        "source_type": source_type,
+        "bakai_rate": bakai_rate or "",
+        "aiyl_rate": aiyl_rate or "",
+        "nbkr_rate": nbkr_rate or "",
+        "best_bank": best_bank,
+        "bank_difference_abs": bank_difference_abs or "",
+        "bank_difference_pct": bank_difference_pct or "",
+        "bakai_spread_abs": bakai_spread_abs or "",
+        "bakai_spread_pct": bakai_spread_pct or "",
+        "aiyl_spread_abs": aiyl_spread_abs or "",
+        "aiyl_spread_pct": aiyl_spread_pct or "",
+    })
+
+
+def sync_subscriber_update(update: Update, is_active: bool) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not user or not chat:
+        return
+
+    post_to_google({
+        "event_type": "subscriber_update",
+        "chat_id": chat.id,
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "datetime_bishkek": format_dt_bishkek(),
+        "is_active": is_active,
+    })
+
+
+def get_active_subscribers_from_google() -> Optional[List[int]]:
+    response = post_to_google({
+        "event_type": "get_active_subscribers",
+    })
+
+    if not response or not response.get("ok"):
+        return None
+
+    result = []
+    for chat_id in response.get("active_chat_ids", []):
         try:
-            active_subscribers.add(int(chat_id))
+            result.append(int(chat_id))
         except Exception:
             continue
 
-    return active_subscribers
+    return result
 
 
-def get_effective_subscribers() -> set[int]:
-    """
-    Основной источник подписчиков — Google Sheets.
-    Резервный источник — локальный subscribers.json.
-    """
+# =========================
+# ПОДПИСКИ
+# =========================
+
+def load_subscribers() -> List[int]:
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return []
+
+    try:
+        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except Exception:
+        return []
+
+    result = []
+    for value in data:
+        try:
+            result.append(int(value))
+        except Exception:
+            continue
+
+    return sorted(set(result))
+
+
+def save_subscribers(subscribers: List[int]) -> None:
+    try:
+        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as file:
+            json.dump(sorted(set(subscribers)), file, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logging.exception("Не удалось сохранить subscribers.json: %s", exc)
+
+
+def add_subscriber(chat_id: int) -> None:
+    subscribers = load_subscribers()
+    if chat_id not in subscribers:
+        subscribers.append(chat_id)
+        save_subscribers(subscribers)
+
+
+def remove_subscriber(chat_id: int) -> None:
+    subscribers = load_subscribers()
+    subscribers = [item for item in subscribers if item != chat_id]
+    save_subscribers(subscribers)
+
+
+def get_effective_subscribers() -> List[int]:
     google_subscribers = get_active_subscribers_from_google()
 
     if google_subscribers is not None:
-        return google_subscribers
+        return sorted(set(google_subscribers))
 
     return load_subscribers()
 
@@ -293,1008 +380,1069 @@ def is_user_subscribed(chat_id: int) -> bool:
 
 
 def track_user(update: Update, action: str) -> None:
-    if not update.effective_chat or not update.effective_user:
+    chat = update.effective_chat
+    if not chat:
         return
 
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    now = now_bishkek_str()
-    data = load_users()
-    users = data.setdefault("users", {})
-
-    key = str(chat_id)
-    existing = users.get(key, {})
-
-    actions_count = int(existing.get("actions_count", 0)) + 1
-    first_seen = existing.get("first_seen", now)
-    is_subscribed = is_user_subscribed(chat_id)
-
-    users[key] = {
-        "chat_id": chat_id,
-        "username": user.username or "",
-        "first_name": user.first_name or "",
-        "last_name": user.last_name or "",
-        "first_seen": first_seen,
-        "last_seen": now,
-        "actions_count": actions_count,
-        "last_action": action,
-    }
-
-    data["updated_at"] = datetime.now(BISHKEK_TZ).isoformat()
-    save_users(data)
-
-    sync_to_google_sheets(
-        {
-            "event_type": "user_activity",
-            "datetime_bishkek": now,
-            "chat_id": chat_id,
-            "username": user.username or "",
-            "first_name": user.first_name or "",
-            "last_name": user.last_name or "",
-            "first_seen": first_seen,
-            "last_seen": now,
-            "actions_count": actions_count,
-            "last_action": action,
-            "is_subscribed": is_subscribed,
-        }
-    )
+    subscribed = is_user_subscribed(chat.id)
+    sync_user_activity(update, action, subscribed)
 
 
-def sync_subscriber_update(update: Update, is_active: bool) -> None:
-    if not update.effective_chat or not update.effective_user:
-        return
+# =========================
+# ПАРСЕРЫ ТЕКУЩИХ КУРСОВ
+# =========================
 
-    chat_id = update.effective_chat.id
-    user = update.effective_user
+def get_nbkr_rate_for_date(date_obj: Optional[datetime] = None) -> Tuple[Optional[float], str]:
+    if date_obj is None:
+        url = "https://www.nbkr.kg/XML/daily.xml"
+    else:
+        date_req = date_obj.strftime("%d.%m.%Y")
+        url = f"https://www.nbkr.kg/XML/daily.xml?date_req={date_req}"
 
-    sync_to_google_sheets(
-        {
-            "event_type": "subscriber_update",
-            "datetime_bishkek": now_bishkek_str(),
-            "chat_id": chat_id,
-            "username": user.username or "",
-            "first_name": user.first_name or "",
-            "last_name": user.last_name or "",
-            "is_active": is_active,
-        }
-    )
-
-
-def is_admin(update: Update) -> bool:
-    if not update.effective_chat:
-        return False
-
-    return update.effective_chat.id == ADMIN_CHAT_ID
-
-
-def get_nbkr_rub_rate() -> dict:
     try:
-        response = requests.get(NBKR_DAILY_XML_URL, timeout=15)
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
-
-        if not response.encoding:
-            response.encoding = "windows-1251"
-
-        root = ET.fromstring(response.text)
-        xml_date = root.attrib.get("Date", "дата не указана")
-
-        for currency in root.findall("Currency"):
-            if currency.attrib.get("ISOCode") == "RUB":
-                nominal_text = currency.findtext("Nominal")
-                value_text = currency.findtext("Value")
-
-                if not nominal_text or not value_text:
-                    return {
-                        "ok": False,
-                        "rate": None,
-                        "date": xml_date,
-                        "error": "На сайте НБКР найдена валюта RUB, но отсутствует Nominal или Value.",
-                    }
-
-                nominal = parse_rate_value(nominal_text)
-                value = parse_rate_value(value_text)
-
-                if nominal <= 0:
-                    return {
-                        "ok": False,
-                        "rate": None,
-                        "date": xml_date,
-                        "error": "На сайте НБКР некорректный Nominal для RUB.",
-                    }
-
-                return {
-                    "ok": True,
-                    "rate": value / nominal,
-                    "date": xml_date,
-                    "error": None,
-                }
-
-        return {
-            "ok": False,
-            "rate": None,
-            "date": xml_date,
-            "error": "На сайте НБКР не найдена валюта RUB.",
-        }
-
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "rate": None,
-            "date": None,
-            "error": f"Ошибка запроса к сайту НБКР: {exc}",
-        }
-    except ET.ParseError as exc:
-        return {
-            "ok": False,
-            "rate": None,
-            "date": None,
-            "error": f"Ошибка разбора данных НБКР: {exc}",
-        }
     except Exception as exc:
-        return {
-            "ok": False,
-            "rate": None,
-            "date": None,
-            "error": f"Неожиданная ошибка при получении курса НБКР: {exc}",
-        }
+        logging.exception("Ошибка получения курса НБКР: %s", exc)
+        return None, "НБКР: не удалось получить данные"
 
-
-def get_bakai_cashless_rub_sell_rate() -> dict:
     try:
-        response = requests.get(
-            BAKAI_BANK_URL,
-            timeout=20,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (compatible; KgsRubBot/1.0; "
-                    "+https://github.com/ninokovank-blip/kgs-rub-bot)"
-                ),
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
-        )
+        root = ET.fromstring(response.content)
+    except Exception as exc:
+        logging.exception("Ошибка разбора XML НБКР: %s", exc)
+        return None, "НБКР: не удалось разобрать данные"
+
+    for currency in root.findall(".//Currency"):
+        if currency.attrib.get("ISOCode") == "RUB":
+            nominal = parse_float(currency.findtext("Nominal")) or 1
+            value = parse_float(currency.findtext("Value"))
+            if value is None:
+                return None, "НБКР: курс RUB не найден"
+
+            rate = value / nominal
+            return rate, "НБКР: получен с официального сайта НБКР"
+
+    return None, "НБКР: курс RUB не найден"
+
+
+def get_bakai_rate() -> Tuple[Optional[float], str]:
+    url = "https://bakai.kg/"
+
+    try:
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
-
         html = response.text
+    except Exception as exc:
+        logging.exception("Ошибка получения курса Бакай: %s", exc)
+        return None, "Бакай Банк: не удалось получить данные"
 
-        normalized = html.replace('\\"', '"')
-        normalized = normalized.replace("\\/", "/")
+    try:
+        # На сайте Бакай данные часто лежат в Next.js/JSON-фрагментах.
+        # Ищем блок RUB -> non_cash -> sell максимально гибко.
+        patterns = [
+            r'"RUB".{0,2000}?"non_cash".{0,1000}?"sell"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
+            r'"rub".{0,2000}?"non_cash".{0,1000}?"sell"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
+            r'RUB.{0,2000}?non_cash.{0,1000}?sell.{0,50}?([0-9]+(?:[.,][0-9]+)?)',
+        ]
 
+        rate = None
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+            if match:
+                rate = parse_float(match.group(1))
+                if rate:
+                    break
+
+        if rate is None:
+            return None, "Бакай Банк: курс RUB / безналичная продажа не найден"
+
+        date_text = ""
         date_match = re.search(
             r'"last_execution"\s*:\s*"([^"]+)"',
-            normalized,
-            flags=re.S,
+            html,
+            re.IGNORECASE,
         )
-        site_date = date_match.group(1) if date_match else "дата не найдена"
+        if date_match:
+            raw = date_match.group(1)
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                date_text = parsed.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                date_text = raw[:16]
 
-        pattern = (
-            r'"RUB"\s*:\s*\{.*?'
-            r'"non_cash"\s*:\s*\{'
-            r'\s*"buy"\s*:\s*([0-9]+(?:\.[0-9]+)?|null)\s*,'
-            r'\s*"sell"\s*:\s*([0-9]+(?:\.[0-9]+)?|null)'
-        )
+        if date_text:
+            source = (
+                "Бакай Банк: получен с официального сайта, "
+                f"тип курса: RUB / безналичная продажа, дата обновления на сайте: {date_text}"
+            )
+        else:
+            source = (
+                "Бакай Банк: получен с официального сайта, "
+                "тип курса: RUB / безналичная продажа"
+            )
 
-        match = re.search(pattern, normalized, flags=re.S)
+        return rate, source
 
-        if not match:
-            return {
-                "ok": False,
-                "rate": None,
-                "buy_rate": None,
-                "sell_rate": None,
-                "date": site_date,
-                "error": (
-                    "Не удалось найти RUB -> non_cash -> sell "
-                    "в данных официального сайта Бакай Банка."
-                ),
-            }
-
-        buy_text = match.group(1)
-        sell_text = match.group(2)
-
-        if buy_text == "null" or sell_text == "null":
-            return {
-                "ok": False,
-                "rate": None,
-                "buy_rate": None,
-                "sell_rate": None,
-                "date": site_date,
-                "error": "В данных Бакай Банка RUB/non_cash содержит null вместо курса.",
-            }
-
-        rub_buy = parse_rate_value(buy_text)
-        rub_sell = parse_rate_value(sell_text)
-
-        if rub_sell <= 0:
-            return {
-                "ok": False,
-                "rate": None,
-                "buy_rate": rub_buy,
-                "sell_rate": rub_sell,
-                "date": site_date,
-                "error": "Найденный курс продажи RUB Бакай Банка некорректен.",
-            }
-
-        return {
-            "ok": True,
-            "rate": rub_sell,
-            "buy_rate": rub_buy,
-            "sell_rate": rub_sell,
-            "date": site_date,
-            "error": None,
-        }
-
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "rate": None,
-            "buy_rate": None,
-            "sell_rate": None,
-            "date": None,
-            "error": f"Ошибка запроса к официальному сайту Бакай Банка: {exc}",
-        }
     except Exception as exc:
-        return {
-            "ok": False,
-            "rate": None,
-            "buy_rate": None,
-            "sell_rate": None,
-            "date": None,
-            "error": f"Неожиданная ошибка при получении курса Бакай Банка: {exc}",
-        }
+        logging.exception("Ошибка разбора курса Бакай: %s", exc)
+        return None, "Бакай Банк: ошибка разбора данных"
 
 
-def get_aiyl_cashless_rub_sell_rate() -> dict:
+def get_aiyl_rate() -> Tuple[Optional[float], str]:
+    url = "https://abank.kg/ky"
+
     try:
-        response = requests.get(
-            AIYL_BANK_URL,
-            timeout=20,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (compatible; KgsRubBot/1.0; "
-                    "+https://github.com/ninokovank-blip/kgs-rub-bot)"
-                ),
-                "Accept-Language": "ky-KG,ky;q=0.9,ru-RU;q=0.8,ru;q=0.7,en-US;q=0.6,en;q=0.5",
-            },
-        )
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
+        html = response.text
+    except Exception as exc:
+        logging.exception("Ошибка получения курса A-bank: %s", exc)
+        return None, "Айыл Банк / A-bank: не удалось получить данные"
 
-        if not response.encoding:
-            response.encoding = "utf-8"
+    try:
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
 
-        text = html_to_text(response.text)
+        # Ищем участки рядом с RUB. У A-bank структура может меняться,
+        # поэтому берём наиболее вероятный второй числовой показатель после RUB как продажу.
+        rub_positions = [m.start() for m in re.finditer(r"\bRUB\b|Руб", text, re.IGNORECASE)]
+
+        candidates = []
+        for pos in rub_positions:
+            chunk = text[pos:pos + 500]
+            nums = re.findall(r"\d+[.,]\d+", chunk)
+            parsed_nums = [parse_float(x) for x in nums]
+            parsed_nums = [x for x in parsed_nums if x is not None]
+
+            if len(parsed_nums) >= 2:
+                candidates.append(parsed_nums[1])
+
+        if not candidates:
+            return None, "Айыл Банк / A-bank: курс RUB / безналичная продажа не найден"
+
+        # Для безналичной продажи в текущей логике берём наиболее вероятный sell.
+        rate = candidates[-1]
 
         date_match = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
-        site_date = date_match.group(0) if date_match else "дата не найдена"
+        date_text = date_match.group(0) if date_match else ""
 
-        pattern = (
-            r"Валюта\s+Сатып\s+алуу\s+Сатуу"
-            r".*?RUB\s+([0-9]+(?:[.,][0-9]+)?)\s+([0-9]+(?:[.,][0-9]+)?)"
+        source = (
+            "Айыл Банк / A-bank: получен с официального сайта, "
+            "тип курса: безналичная продажа RUB"
         )
+        if date_text:
+            source += f", дата на сайте: {date_text}"
 
-        matches = re.findall(pattern, text, flags=re.S | re.I)
+        return rate, source
 
-        if len(matches) < 2:
-            return {
-                "ok": False,
-                "rate": None,
-                "buy_rate": None,
-                "sell_rate": None,
-                "date": site_date,
-                "error": (
-                    "Не удалось уверенно найти второй банковский блок курсов "
-                    "Айыл Банка для безналичных операций."
-                ),
-            }
-
-        cashless_buy_text, cashless_sell_text = matches[1]
-        cashless_buy = parse_rate_value(cashless_buy_text)
-        cashless_sell = parse_rate_value(cashless_sell_text)
-
-        if cashless_sell <= 0:
-            return {
-                "ok": False,
-                "rate": None,
-                "buy_rate": cashless_buy,
-                "sell_rate": cashless_sell,
-                "date": site_date,
-                "error": "Найденный курс продажи Айыл Банка некорректен.",
-            }
-
-        return {
-            "ok": True,
-            "rate": cashless_sell,
-            "buy_rate": cashless_buy,
-            "sell_rate": cashless_sell,
-            "date": site_date,
-            "error": None,
-        }
-
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "rate": None,
-            "buy_rate": None,
-            "sell_rate": None,
-            "date": None,
-            "error": f"Ошибка запроса к сайту Айыл Банка: {exc}",
-        }
     except Exception as exc:
-        return {
-            "ok": False,
-            "rate": None,
-            "buy_rate": None,
-            "sell_rate": None,
-            "date": None,
-            "error": f"Неожиданная ошибка при получении курса Айыл Банка: {exc}",
-        }
+        logging.exception("Ошибка разбора курса A-bank: %s", exc)
+        return None, "Айыл Банк / A-bank: ошибка разбора данных"
 
 
-async def get_rates_async() -> dict:
-    nbkr_data = get_nbkr_rub_rate()
-    aiyl_data = get_aiyl_cashless_rub_sell_rate()
-    bakai_data = get_bakai_cashless_rub_sell_rate()
-
-    if nbkr_data["ok"]:
-        nbkr_rate = nbkr_data["rate"]
-        nbkr_status = f"получен с официального сайта НБКР, дата курса: {nbkr_data['date']}"
-    else:
-        nbkr_rate = DEFAULT_NBKR_FALLBACK
-        nbkr_status = f"не получен, используется резервный тестовый курс. Причина: {nbkr_data['error']}"
-
-    if aiyl_data["ok"]:
-        aiyl_rate = aiyl_data["rate"]
-        aiyl_status = (
-            f"получен с официального сайта, тип курса: безналичная продажа RUB, "
-            f"дата на сайте: {aiyl_data['date']}"
-        )
-    else:
-        aiyl_rate = DEFAULT_AIYL_FALLBACK
-        aiyl_status = (
-            "не получен, используется резервный тестовый курс. "
-            f"Причина: {aiyl_data['error']}"
-        )
-
-    if bakai_data["ok"]:
-        bakai_rate = bakai_data["rate"]
-        bakai_date = format_source_datetime(bakai_data["date"])
-        bakai_status = (
-            f"получен с официального сайта, тип курса: RUB / безналичная продажа, "
-            f"дата обновления на сайте: {bakai_date}"
-        )
-    else:
-        bakai_rate = DEFAULT_BAKAI_FALLBACK
-        bakai_status = (
-            "не получен, используется резервный тестовый курс. "
-            f"Причина: {bakai_data['error']}"
-        )
+def collect_current_rates() -> Dict[str, Any]:
+    bakai_rate, bakai_source = get_bakai_rate()
+    aiyl_rate, aiyl_source = get_aiyl_rate()
+    nbkr_rate, nbkr_source = get_nbkr_rate_for_date()
 
     return {
-        "bakai": bakai_rate,
-        "aiyl": aiyl_rate,
-        "nbkr": nbkr_rate,
-        "source_status": (
-            "Статус источников:\n"
-            f"• Бакай Банк: {bakai_status}\n"
-            f"• Айыл Банк / A-bank: {aiyl_status}\n"
-            f"• НБКР: {nbkr_status}"
-        ),
-    }
-
-
-def parse_amount_text(text: str) -> float | None:
-    if not text:
-        return None
-
-    cleaned = text.strip()
-    cleaned = cleaned.replace("RUB", "")
-    cleaned = cleaned.replace("rub", "")
-    cleaned = cleaned.replace("РУБ", "")
-    cleaned = cleaned.replace("руб", "")
-    cleaned = cleaned.replace("₽", "")
-    cleaned = cleaned.replace(" ", "")
-
-    if cleaned.count(",") > 0 and cleaned.count(".") == 0:
-        cleaned = cleaned.replace(",", "")
-    elif cleaned.count(".") > 1 and cleaned.count(",") == 0:
-        cleaned = cleaned.replace(".", "")
-    elif cleaned.count(",") > 0 and cleaned.count(".") > 0:
-        cleaned = cleaned.replace(",", "")
-
-    try:
-        amount = float(cleaned)
-    except ValueError:
-        return None
-
-    if amount <= 0:
-        return None
-
-    return amount
-
-
-def get_best_bank_by_rate(rates: dict) -> dict:
-    bakai_rate = rates["bakai"]
-    aiyl_rate = rates["aiyl"]
-
-    if bakai_rate < aiyl_rate:
-        best_bank = "Бакай Банк"
-        best_rate = bakai_rate
-        worst_bank = "Айыл Банк / A-bank"
-        worst_rate = aiyl_rate
-    elif aiyl_rate < bakai_rate:
-        best_bank = "Айыл Банк / A-bank"
-        best_rate = aiyl_rate
-        worst_bank = "Бакай Банк"
-        worst_rate = bakai_rate
-    else:
-        best_bank = "Курсы равны"
-        best_rate = bakai_rate
-        worst_bank = "Курсы равны"
-        worst_rate = aiyl_rate
-
-    absolute_difference = abs(bakai_rate - aiyl_rate)
-
-    if best_rate > 0 and best_bank != "Курсы равны":
-        percent_difference = ((worst_rate / best_rate) - 1) * 100
-    else:
-        percent_difference = 0
-
-    return {
-        "best_bank": best_bank,
-        "best_rate": best_rate,
-        "worst_bank": worst_bank,
-        "worst_rate": worst_rate,
-        "absolute_difference": absolute_difference,
-        "percent_difference": percent_difference,
-    }
-
-
-def calculate_purchase_cost(target_rub: float, rates: dict) -> dict:
-    bakai_rate = rates["bakai"]
-    aiyl_rate = rates["aiyl"]
-    nbkr_rate = rates["nbkr"]
-
-    cost_bakai_kgs = target_rub * bakai_rate
-    cost_aiyl_kgs = target_rub * aiyl_rate
-    cost_nbkr_kgs = target_rub * nbkr_rate
-
-    bakai_vs_nbkr_kgs = cost_bakai_kgs - cost_nbkr_kgs
-    aiyl_vs_nbkr_kgs = cost_aiyl_kgs - cost_nbkr_kgs
-
-    best_info = get_best_bank_by_rate(rates)
-
-    if best_info["best_bank"] == "Бакай Банк":
-        saving_kgs = cost_aiyl_kgs - cost_bakai_kgs
-    elif best_info["best_bank"] == "Айыл Банк / A-bank":
-        saving_kgs = cost_bakai_kgs - cost_aiyl_kgs
-    else:
-        saving_kgs = 0
-
-    bakai_spread_abs = bakai_rate - nbkr_rate
-    aiyl_spread_abs = aiyl_rate - nbkr_rate
-
-    bakai_spread_pct = ((bakai_rate / nbkr_rate) - 1) * 100
-    aiyl_spread_pct = ((aiyl_rate / nbkr_rate) - 1) * 100
-
-    return {
-        "target_rub": target_rub,
         "bakai_rate": bakai_rate,
+        "bakai_source": bakai_source,
         "aiyl_rate": aiyl_rate,
+        "aiyl_source": aiyl_source,
         "nbkr_rate": nbkr_rate,
-        "cost_bakai_kgs": cost_bakai_kgs,
-        "cost_aiyl_kgs": cost_aiyl_kgs,
-        "cost_nbkr_kgs": cost_nbkr_kgs,
-        "bakai_vs_nbkr_kgs": bakai_vs_nbkr_kgs,
-        "aiyl_vs_nbkr_kgs": aiyl_vs_nbkr_kgs,
-        "best_bank": best_info["best_bank"],
-        "absolute_difference": best_info["absolute_difference"],
-        "percent_difference": best_info["percent_difference"],
-        "saving_kgs": saving_kgs,
-        "bakai_spread_abs": bakai_spread_abs,
-        "bakai_spread_pct": bakai_spread_pct,
-        "aiyl_spread_abs": aiyl_spread_abs,
-        "aiyl_spread_pct": aiyl_spread_pct,
-        "bakai_below_nbkr": bakai_rate < nbkr_rate,
-        "aiyl_below_nbkr": aiyl_rate < nbkr_rate,
+        "nbkr_source": nbkr_source,
     }
 
 
-def sync_rates_log_to_google(source_type: str, rates_data: dict) -> None:
-    best_info = get_best_bank_by_rate(rates_data)
+def build_rates_message(rates_data: Dict[str, Any]) -> str:
+    bakai_rate = rates_data.get("bakai_rate")
+    aiyl_rate = rates_data.get("aiyl_rate")
+    nbkr_rate = rates_data.get("nbkr_rate")
 
-    bakai_spread_abs = rates_data["bakai"] - rates_data["nbkr"]
-    aiyl_spread_abs = rates_data["aiyl"] - rates_data["nbkr"]
+    lines = []
+    lines.append("📊 Курсы RUB / KGS сейчас")
+    lines.append("Тип курса: безналичная продажа RUB")
+    lines.append("")
 
-    bakai_spread_pct = ((rates_data["bakai"] / rates_data["nbkr"]) - 1) * 100
-    aiyl_spread_pct = ((rates_data["aiyl"] / rates_data["nbkr"]) - 1) * 100
+    lines.append(f"Бакай Банк: {fmt_rate(bakai_rate)}")
+    lines.append(f"Айыл Банк / A-bank: {fmt_rate(aiyl_rate)}")
+    lines.append(f"НБКР: {fmt_rate(nbkr_rate)}")
+    lines.append("")
 
-    sync_to_google_sheets(
-        {
-            "event_type": "rates_log",
-            "datetime_bishkek": now_bishkek_str(),
-            "source_type": source_type,
-            "bakai_rate": rates_data["bakai"],
-            "aiyl_rate": rates_data["aiyl"],
-            "nbkr_rate": rates_data["nbkr"],
-            "best_bank": best_info["best_bank"],
-            "bank_difference_abs": best_info["absolute_difference"],
-            "bank_difference_pct": best_info["percent_difference"],
-            "bakai_spread_abs": bakai_spread_abs,
-            "bakai_spread_pct": bakai_spread_pct,
-            "aiyl_spread_abs": aiyl_spread_abs,
-            "aiyl_spread_pct": aiyl_spread_pct,
-        }
-    )
+    available_banks = []
+    if bakai_rate:
+        available_banks.append(("Бакай Банк", bakai_rate))
+    if aiyl_rate:
+        available_banks.append(("Айыл Банк / A-bank", aiyl_rate))
 
+    if available_banks:
+        best_bank, best_rate = min(available_banks, key=lambda x: x[1])
+        lines.append(f"Лучший курс сейчас: {best_bank} — {fmt_rate(best_rate)}")
+        lines.append("")
 
-def build_calculator_message(result: dict, source_status: str) -> str:
-    now = now_bishkek_short()
+    if nbkr_rate:
+        lines.append("Спред к НБКР:")
+        if bakai_rate:
+            spread = (bakai_rate / nbkr_rate - 1) * 100
+            lines.append(f"Бакай Банк: {fmt_pct(spread)}")
+        if aiyl_rate:
+            spread = (aiyl_rate / nbkr_rate - 1) * 100
+            lines.append(f"Айыл Банк / A-bank: {fmt_pct(spread)}")
+        lines.append("")
 
-    if result["best_bank"] == "Курсы равны":
-        comment = "Курсы банков равны. Существенной разницы для выбора банка нет."
-    else:
-        comment = (
-            f"Выгоднее покупать RUB через {result['best_bank']}, "
-            "потому что курс продажи RUB ниже и для покупки нужной суммы потребуется меньше KGS."
-        )
-
-    anomaly_notes = []
-
-    if result["bakai_below_nbkr"]:
-        anomaly_notes.append(
-            "Бакай Банк ниже курса НБКР — требуется ручная проверка типа курса и источника."
-        )
-
-    if result["aiyl_below_nbkr"]:
-        anomaly_notes.append(
-            "Айыл Банк / A-bank ниже курса НБКР — требуется ручная проверка типа курса и источника."
-        )
-
-    if anomaly_notes:
-        anomaly_text = "\n\nПроверка аномалий:\n" + "\n".join(f"• {note}" for note in anomaly_notes)
-    else:
-        anomaly_text = "\n\nПроверка аномалий:\nАномалий по сравнению с НБКР не выявлено."
-
-    return (
-        "Калькулятор покупки RUB за KGS\n"
-        f"Дата и время: {now} Бишкек\n\n"
-        "Тип курса: безналичная продажа RUB\n\n"
-        "Курсы RUB / KGS:\n"
-        f"Бакай Банк: {format_rate(result['bakai_rate'])}\n"
-        f"Айыл Банк / A-bank: {format_rate(result['aiyl_rate'])}\n"
-        f"НБКР: {format_rate(result['nbkr_rate'])}\n\n"
-        f"Цель: купить {format_number(result['target_rub'], 0)} RUB\n\n"
-        f"Выгоднее: {result['best_bank']}\n\n"
-        "Сколько KGS потребуется:\n"
-        f"Бакай Банк: {format_number(result['cost_bakai_kgs'], 2)} KGS\n"
-        f"Айыл Банк / A-bank: {format_number(result['cost_aiyl_kgs'], 2)} KGS\n"
-        f"Ориентир по НБКР: {format_number(result['cost_nbkr_kgs'], 2)} KGS\n\n"
-        "Разница между банками:\n"
-        f"{format_rate(result['absolute_difference'])} KGS за 1 RUB / "
-        f"{format_number(result['percent_difference'], 2)}%\n\n"
-        "Экономия при выборе лучшего банка:\n"
-        f"{format_number(result['saving_kgs'], 2)} KGS\n\n"
-        "Спред к НБКР за 1 RUB:\n"
-        f"Бакай Банк: {format_rate(result['bakai_spread_abs'])} KGS / "
-        f"{format_number(result['bakai_spread_pct'], 2)}%\n"
-        f"Айыл Банк / A-bank: {format_rate(result['aiyl_spread_abs'])} KGS / "
-        f"{format_number(result['aiyl_spread_pct'], 2)}%\n\n"
-        f"Отклонение от НБКР на сумму {format_number(result['target_rub'], 0)} RUB:\n"
-        f"Бакай Банк: {format_number(result['bakai_vs_nbkr_kgs'], 2)} KGS\n"
-        f"Айыл Банк / A-bank: {format_number(result['aiyl_vs_nbkr_kgs'], 2)} KGS"
-        f"{anomaly_text}\n\n"
-        "Комментарий:\n"
-        f"{comment}\n\n"
-        f"{source_status}"
-    )
-
-
-def build_notification_message(rates_data: dict) -> str:
-    best_info = get_best_bank_by_rate(rates_data)
-    now = now_bishkek_short()
-
-    bakai_spread_abs = rates_data["bakai"] - rates_data["nbkr"]
-    aiyl_spread_abs = rates_data["aiyl"] - rates_data["nbkr"]
-
-    bakai_spread_pct = ((rates_data["bakai"] / rates_data["nbkr"]) - 1) * 100
-    aiyl_spread_pct = ((rates_data["aiyl"] / rates_data["nbkr"]) - 1) * 100
-
-    if best_info["best_bank"] == "Курсы равны":
-        conclusion = "Курсы банков равны."
-    else:
-        conclusion = (
-            f"Выгоднее сейчас: {best_info['best_bank']} "
-            "за счёт более низкого курса продажи RUB."
-        )
-
-    return (
-        "Плановое уведомление по курсам RUB / KGS\n"
-        f"Дата и время: {now} Бишкек\n\n"
-        "Тип курса: безналичная продажа RUB\n\n"
-        f"Бакай Банк: {format_rate(rates_data['bakai'])}\n"
-        f"Айыл Банк / A-bank: {format_rate(rates_data['aiyl'])}\n"
-        f"НБКР: {format_rate(rates_data['nbkr'])}\n\n"
-        f"{conclusion}\n\n"
-        "Разница между банками:\n"
-        f"{format_rate(best_info['absolute_difference'])} KGS за 1 RUB / "
-        f"{format_number(best_info['percent_difference'], 2)}%\n\n"
-        "Спред к НБКР:\n"
-        f"• Бакай Банк: {format_rate(bakai_spread_abs)} KGS / {format_number(bakai_spread_pct, 2)}%\n"
-        f"• Айыл Банк / A-bank: {format_rate(aiyl_spread_abs)} KGS / {format_number(aiyl_spread_pct, 2)}%\n\n"
-        "Чтобы открыть калькулятор, нажмите 🧮 Калькулятор.\n"
-        "Чтобы отключить рассылку, нажмите 🔕 Отписаться."
-    )
-
-
-def build_users_report() -> str:
-    data = load_users()
-    users = data.get("users", {})
-    subscribers = get_effective_subscribers()
-
-    if not users:
-        return "Пока нет зафиксированных пользователей."
-
-    sorted_users = sorted(
-        users.values(),
-        key=lambda item: item.get("last_seen", ""),
-        reverse=True,
-    )
-
-    lines = [
-        "Пользователи бота",
-        f"Всего пользователей: {len(sorted_users)}",
-        f"Подписчиков на рассылку: {len(subscribers)}",
-        "",
-    ]
-
-    for index, user in enumerate(sorted_users[:30], start=1):
-        chat_id = int(user.get("chat_id", 0))
-        username = user.get("username") or ""
-        first_name = user.get("first_name") or ""
-        last_name = user.get("last_name") or ""
-        full_name = f"{first_name} {last_name}".strip() or "имя не указано"
-
-        username_text = f"@{username}" if username else "username не указан"
-        subscribed_text = "да" if chat_id in subscribers else "нет"
-
-        lines.extend(
-            [
-                f"{index}. {full_name} / {username_text}",
-                f"chat_id: {chat_id}",
-                f"первый запуск: {user.get('first_seen', 'н/д')}",
-                f"последняя активность: {user.get('last_seen', 'н/д')}",
-                f"действий: {user.get('actions_count', 0)}",
-                f"последнее действие: {user.get('last_action', 'н/д')}",
-                f"рассылка: {subscribed_text}",
-                "",
-            ]
-        )
-
-    if len(sorted_users) > 30:
-        lines.append(f"Показаны последние 30 пользователей из {len(sorted_users)}.")
+    lines.append("Источники:")
+    lines.append(f"• {rates_data.get('bakai_source')}")
+    lines.append(f"• {rates_data.get('aiyl_source')}")
+    lines.append(f"• {rates_data.get('nbkr_source')}")
 
     return "\n".join(lines)
 
 
-def parse_target_rub_from_command(context: ContextTypes.DEFAULT_TYPE) -> float | None:
-    if not context.args:
+# =========================
+# ИСТОРИЯ BANKS.KG
+# =========================
+
+def parse_bankskg_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
         return None
 
-    raw_amount = " ".join(context.args)
-    return parse_amount_text(raw_amount)
+    # Часто графики отдают timestamp в миллисекундах.
+    if isinstance(value, (int, float)):
+        try:
+            numeric = float(value)
+            if numeric > 10_000_000_000:
+                numeric = numeric / 1000
+            return datetime.fromtimestamp(numeric, tz=BISHKEK_TZ)
+        except Exception:
+            return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Числовой timestamp строкой.
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        try:
+            numeric = float(text)
+            if numeric > 10_000_000_000:
+                numeric = numeric / 1000
+            return datetime.fromtimestamp(numeric, tz=BISHKEK_TZ)
+        except Exception:
+            pass
+
+    # ISO / обычная дата.
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y",
+        "%Y-%m-%d",
+    ):
+        try:
+            parsed = datetime.strptime(text[:26], fmt)
+            return parsed.replace(tzinfo=BISHKEK_TZ)
+        except Exception:
+            continue
+
+    return None
 
 
-async def show_users_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_typing(update, context)
+def normalize_history_points(raw_points: Any) -> List[Dict[str, Any]]:
+    result = []
 
-    report = build_users_report()
+    if not raw_points:
+        return result
 
-    if len(report) <= 4000:
-        await update.message.reply_text(report, reply_markup=keyboard_for_update(update))
-        return
+    if not isinstance(raw_points, list):
+        return result
 
-    chunks = [report[i:i + 4000] for i in range(0, len(report), 4000)]
+    for item in raw_points:
+        dt = None
+        rate = None
 
-    for chunk in chunks:
-        await update.message.reply_text(chunk, reply_markup=keyboard_for_update(update))
+        if isinstance(item, list) and len(item) >= 2:
+            dt = parse_bankskg_timestamp(item[0])
+            rate = parse_float(item[1])
+
+        elif isinstance(item, dict):
+            # Поддерживаем несколько возможных форматов.
+            dt_value = (
+                item.get("date")
+                or item.get("datetime")
+                or item.get("created_at")
+                or item.get("time")
+                or item.get("timestamp")
+                or item.get("x")
+            )
+
+            rate_value = (
+                item.get("value")
+                or item.get("rate")
+                or item.get("y")
+                or item.get("sell")
+                or item.get("buy")
+            )
+
+            dt = parse_bankskg_timestamp(dt_value)
+            rate = parse_float(rate_value)
+
+        if dt and rate:
+            result.append({
+                "datetime": dt,
+                "date": dt.date(),
+                "rate": rate,
+            })
+
+    result.sort(key=lambda x: x["datetime"])
+    return result
 
 
-async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        track_user(update, "unknown_command_users")
-
-        await update.message.reply_text(
-            "Не понял команду.\n\n"
-            "Выберите действие кнопкой ниже или напишите /help.",
-            reply_markup=keyboard_for_update(update),
-        )
-        return
-
-    await send_typing(update, context)
-
-    track_user(update, "users")
-    await show_users_to_admin(update, context)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    track_user(update, "start")
-
-    message = (
-        "Здравствуйте!\n\n"
-        "Я бот для мониторинга курсов RUB / KGS.\n\n"
-        "Что я показываю:\n"
-        "• текущие курсы Бакай Банка, Айыл Банка / A-bank и НБКР;\n"
-        "• какой банк выгоднее для покупки RUB за KGS;\n"
-        "• спред каждого банка к курсу НБКР;\n"
-        "• расчёт потребности в KGS для покупки заданной суммы RUB;\n"
-        "• плановые уведомления по курсам в будние дни.\n\n"
-        "Главная логика:\n"
-        "вы вводите, сколько RUB нужно купить, а я считаю, сколько KGS потребуется через каждый банк.\n\n"
-        "Доступные действия:\n"
-        "📊 Курсы сейчас — показать актуальные курсы и лучший банк на текущий момент\n"
-        "🧮 Калькулятор — рассчитать, сколько KGS потребуется для покупки нужной суммы RUB\n"
-        "🔔 Подписаться на рассылку — получать курсы в будние дни с 07:00 до 17:00 по Бишкеку\n"
-        "🔕 Отписаться — отключить автоматические уведомления\n"
-        "❓ Помощь — посмотреть описание команд и логики расчёта\n\n"
-        "Команды:\n"
-        "/start — перезапустить бота и показать главное меню\n"
-        "/rates — показать текущие курсы\n"
-        "/calc — открыть калькулятор покупки RUB\n"
-        "/subscribe — подписаться на рассылку\n"
-        "/unsubscribe — отписаться от рассылки\n"
-        "/help — помощь"
+def fetch_bank_history_from_bankskg(organization_id: int) -> Dict[str, Any]:
+    url = (
+        "https://banks.kg/api/rates/bank-history-cached"
+        f"?currency=rub&organization_id={organization_id}&type=cashless"
     )
 
-    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://banks.kg/",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        logging.exception("Ошибка banks.kg для organization_id=%s: %s", organization_id, exc)
+        return {"buy": [], "sell": []}
+
+    # Ожидаемый вариант: {"buy": [...], "sell": [...]}
+    # Но делаем гибко на случай вложенности.
+    if isinstance(data, dict):
+        if "buy" in data or "sell" in data:
+            return {
+                "buy": normalize_history_points(data.get("buy")),
+                "sell": normalize_history_points(data.get("sell")),
+            }
+
+        for key in ("data", "result", "history"):
+            nested = data.get(key)
+            if isinstance(nested, dict) and ("buy" in nested or "sell" in nested):
+                return {
+                    "buy": normalize_history_points(nested.get("buy")),
+                    "sell": normalize_history_points(nested.get("sell")),
+                }
+
+    return {"buy": [], "sell": []}
+
+
+def parse_history_period(text: str) -> Tuple[Optional[datetime], Optional[datetime], Optional[str]]:
+    normalized = text.strip().lower()
+    normalized = normalized.replace("—", "-").replace("–", "-")
+
+    today = now_bishkek().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    match = re.search(r"последн\w*\s+(\d+)\s+д", normalized)
+    if match:
+        days = int(match.group(1))
+        if days <= 0:
+            return None, None, "Период должен быть больше 0 дней."
+        if days > MAX_HISTORY_DAYS:
+            return None, None, f"Пока максимальный период для анализа — {MAX_HISTORY_DAYS} дней."
+        start = today - timedelta(days=days - 1)
+        end = today
+        return start, end, None
+
+    dates = re.findall(r"\d{2}\.\d{2}\.\d{4}", normalized)
+
+    if len(dates) == 1:
+        try:
+            start = datetime.strptime(dates[0], "%d.%m.%Y").replace(tzinfo=BISHKEK_TZ)
+            return start, start, None
+        except Exception:
+            return None, None, "Не удалось распознать дату."
+
+    if len(dates) >= 2:
+        try:
+            start = datetime.strptime(dates[0], "%d.%m.%Y").replace(tzinfo=BISHKEK_TZ)
+            end = datetime.strptime(dates[1], "%d.%m.%Y").replace(tzinfo=BISHKEK_TZ)
+        except Exception:
+            return None, None, "Не удалось распознать период."
+
+        if end < start:
+            start, end = end, start
+
+        days_count = (end.date() - start.date()).days + 1
+
+        if days_count > MAX_HISTORY_DAYS:
+            return None, None, f"Пока максимальный период для анализа — {MAX_HISTORY_DAYS} дней."
+
+        return start, end, None
+
+    return None, None, (
+        "Не удалось распознать период.\n\n"
+        "Введите, например:\n"
+        "12.06.2026\n"
+        "01.06.2026-12.06.2026\n"
+        "последние 7 дней"
+    )
+
+
+def get_nbkr_history_rates(start: datetime, end: datetime) -> Dict[Any, float]:
+    result = {}
+    current = start
+
+    while current.date() <= end.date():
+        rate, _ = get_nbkr_rate_for_date(current)
+        if rate:
+            result[current.date()] = rate
+        current += timedelta(days=1)
+
+    return result
+
+
+def calculate_bank_history_summary(
+    bank_name: str,
+    organization_id: int,
+    sell_points: List[Dict[str, Any]],
+    nbkr_rates_by_date: Dict[Any, float],
+    start: datetime,
+    end: datetime,
+) -> Optional[Dict[str, Any]]:
+    filtered = [
+        point for point in sell_points
+        if start.date() <= point["date"] <= end.date()
+    ]
+
+    if not filtered:
+        return None
+
+    rates = [point["rate"] for point in filtered]
+    spreads = []
+
+    for point in filtered:
+        nbkr_rate = nbkr_rates_by_date.get(point["date"])
+        if nbkr_rate:
+            spreads.append((point["rate"] / nbkr_rate - 1) * 100)
+
+    last_point = max(filtered, key=lambda x: x["datetime"])
+
+    return {
+        "bank_name": bank_name,
+        "organization_id": organization_id,
+        "avg_sell_rate": mean(rates),
+        "min_sell_rate": min(rates),
+        "max_sell_rate": max(rates),
+        "last_sell_rate": last_point["rate"],
+        "avg_spread_pct": mean(spreads) if spreads else None,
+        "min_spread_pct": min(spreads) if spreads else None,
+        "max_spread_pct": max(spreads) if spreads else None,
+        "rate_points_count": len(filtered),
+    }
+
+
+def build_top_lines(
+    items: List[Dict[str, Any]],
+    key: str,
+    reverse: bool = False,
+    value_formatter=fmt_rate,
+    limit: int = 5,
+) -> List[str]:
+    valid = [item for item in items if item.get(key) is not None]
+    sorted_items = sorted(valid, key=lambda x: x[key], reverse=reverse)
+
+    lines = []
+    for index, item in enumerate(sorted_items[:limit], start=1):
+        lines.append(
+            f"{index}. {item['bank_name']} — {value_formatter(item[key])}"
+        )
+
+    return lines
+
+
+def build_history_message(
+    start: datetime,
+    end: datetime,
+    summaries: List[Dict[str, Any]],
+    no_data_banks: List[str],
+) -> str:
+    period_text = (
+        format_date(start)
+        if start.date() == end.date()
+        else f"{format_date(start)}–{format_date(end)}"
+    )
+
+    lines = []
+    lines.append(f"📈 История RUB / KGS за {period_text}")
+    lines.append("Тип курса: безналичная продажа RUB")
+    lines.append("")
+
+    if not summaries:
+        lines.append("За выбранный период данные по банкам не найдены.")
+        return "\n".join(lines)
+
+    # Основной рейтинг: чем ниже средний sell, тем лучше.
+    lines.append("Лучший средний курс:")
+    lines.extend(build_top_lines(summaries, "avg_sell_rate", reverse=False, value_formatter=fmt_rate, limit=5))
+    lines.append("")
+
+    lines.append("Минимальный курс за период:")
+    lines.extend(build_top_lines(summaries, "min_sell_rate", reverse=False, value_formatter=fmt_rate, limit=5))
+    lines.append("")
+
+    lines.append("Максимальный курс за период:")
+    lines.extend(build_top_lines(summaries, "max_sell_rate", reverse=True, value_formatter=fmt_rate, limit=5))
+    lines.append("")
+
+    lines.append("Средний спред к НБКР:")
+    spread_lines = build_top_lines(summaries, "avg_spread_pct", reverse=False, value_formatter=fmt_pct, limit=5)
+    if spread_lines:
+        lines.extend(spread_lines)
+    else:
+        lines.append("н/д")
+    lines.append("")
+
+    sorted_by_avg = sorted(summaries, key=lambda x: x["avg_sell_rate"])
+
+    lines.append("Детализация по банкам:")
+    for index, item in enumerate(sorted_by_avg, start=1):
+        lines.append(f"{index}. {item['bank_name']}")
+        lines.append(
+            f"средний: {fmt_rate(item['avg_sell_rate'])} / "
+            f"минимум: {fmt_rate(item['min_sell_rate'])} / "
+            f"максимум: {fmt_rate(item['max_sell_rate'])}"
+        )
+        lines.append(
+            f"последний: {fmt_rate(item['last_sell_rate'])} / "
+            f"средний спред к НБКР: {fmt_pct(item['avg_spread_pct'])} / "
+            f"изменений: {item['rate_points_count']}"
+        )
+        lines.append("")
+
+    if no_data_banks:
+        lines.append("Нет данных за период:")
+        for bank in no_data_banks:
+            lines.append(f"• {bank}")
+        lines.append("")
+
+    best_avg = min(summaries, key=lambda x: x["avg_sell_rate"])
+    best_min = min(summaries, key=lambda x: x["min_sell_rate"])
+    max_rate = max(summaries, key=lambda x: x["max_sell_rate"])
+
+    spread_candidates = [x for x in summaries if x.get("avg_spread_pct") is not None]
+    best_spread = min(spread_candidates, key=lambda x: x["avg_spread_pct"]) if spread_candidates else None
+
+    comment = (
+        f"Комментарий:\n"
+        f"За выбранный период лучший средний курс был у {best_avg['bank_name']} — "
+        f"{fmt_rate(best_avg['avg_sell_rate'])}. "
+        f"Минимальный курс зафиксирован у {best_min['bank_name']} — "
+        f"{fmt_rate(best_min['min_sell_rate'])}, "
+        f"максимальный — у {max_rate['bank_name']} — "
+        f"{fmt_rate(max_rate['max_sell_rate'])}."
+    )
+
+    if best_spread:
+        comment += (
+            f" Наименьший средний спред к НБКР был у {best_spread['bank_name']} — "
+            f"{fmt_pct(best_spread['avg_spread_pct'])}."
+        )
+
+    comment += " Данные приведены для анализа рынка."
+
+    lines.append(comment)
+
+    message = "\n".join(lines)
+
+    # Telegram имеет лимит 4096 символов.
+    # Если банков много и сообщение длинное, режем детализацию, но сохраняем основные рейтинги.
+    if len(message) <= 3900:
+        return message
+
+    lines_short = []
+    lines_short.append(f"📈 История RUB / KGS за {period_text}")
+    lines_short.append("Тип курса: безналичная продажа RUB")
+    lines_short.append("")
+
+    lines_short.append("Лучший средний курс:")
+    lines_short.extend(build_top_lines(summaries, "avg_sell_rate", reverse=False, value_formatter=fmt_rate, limit=5))
+    lines_short.append("")
+
+    lines_short.append("Минимальный курс за период:")
+    lines_short.extend(build_top_lines(summaries, "min_sell_rate", reverse=False, value_formatter=fmt_rate, limit=5))
+    lines_short.append("")
+
+    lines_short.append("Максимальный курс за период:")
+    lines_short.extend(build_top_lines(summaries, "max_sell_rate", reverse=True, value_formatter=fmt_rate, limit=5))
+    lines_short.append("")
+
+    lines_short.append("Средний спред к НБКР:")
+    lines_short.extend(spread_lines if spread_lines else ["н/д"])
+    lines_short.append("")
+
+    lines_short.append("Краткая детализация по банкам:")
+    for index, item in enumerate(sorted_by_avg[:10], start=1):
+        lines_short.append(
+            f"{index}. {item['bank_name']}: "
+            f"средний {fmt_rate(item['avg_sell_rate'])}, "
+            f"min {fmt_rate(item['min_sell_rate'])}, "
+            f"max {fmt_rate(item['max_sell_rate'])}, "
+            f"спред {fmt_pct(item['avg_spread_pct'])}"
+        )
+
+    if no_data_banks:
+        lines_short.append("")
+        lines_short.append("Нет данных за период:")
+        lines_short.append(", ".join(no_data_banks[:10]))
+        if len(no_data_banks) > 10:
+            lines_short.append(f"и ещё {len(no_data_banks) - 10}")
+
+    lines_short.append("")
+    lines_short.append(comment)
+
+    return "\n".join(lines_short)
+
+
+def get_history_analysis(start: datetime, end: datetime) -> str:
+    nbkr_rates_by_date = get_nbkr_history_rates(start, end)
+
+    summaries = []
+    no_data_banks = []
+
+    for bank in HISTORY_BANKS:
+        history = fetch_bank_history_from_bankskg(bank["id"])
+        sell_points = history.get("sell", [])
+
+        summary = calculate_bank_history_summary(
+            bank_name=bank["name"],
+            organization_id=bank["id"],
+            sell_points=sell_points,
+            nbkr_rates_by_date=nbkr_rates_by_date,
+            start=start,
+            end=end,
+        )
+
+        if summary:
+            summaries.append(summary)
+        else:
+            no_data_banks.append(bank["name"])
+
+    return build_history_message(start, end, summaries, no_data_banks)
+
+
+# =========================
+# КОМАНДЫ И СЦЕНАРИИ
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+    context.user_data.pop("mode", None)
+    track_user(update, "start")
+
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
+    text = (
+        "Привет! Я бот для мониторинга RUB / KGS.\n\n"
+        "Я показываю текущие курсы, считаю спред к НБКР, помогаю рассчитать сумму "
+        "для конвертации и анализирую историю курсов по банкам.\n\n"
+        "Выберите действие кнопкой ниже."
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(chat_id),
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+    context.user_data.pop("mode", None)
     track_user(update, "help")
 
-    message = (
-        "Помощь по боту\n\n"
-        "Основные кнопки:\n\n"
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
+    text = (
+        "❓ Помощь\n\n"
+        "Что умеет бот:\n\n"
         "📊 Курсы сейчас\n"
-        "Показывает текущие курсы RUB / KGS по Бакай Банку, Айыл Банку / A-bank и НБКР. "
-        "Также бот сразу определяет, где сейчас выгоднее покупать RUB за KGS.\n\n"
+        "Показывает текущие курсы RUB / KGS по банкам и спред к НБКР.\n\n"
         "🧮 Калькулятор\n"
-        "Используется, когда нужно купить конкретную сумму RUB. "
-        "Вы вводите сумму RUB, а бот считает, сколько KGS потребуется через каждый банк.\n\n"
+        "Можно ввести сумму RUB, которую нужно купить. Бот рассчитает, сколько KGS потребуется "
+        "по доступным курсам.\n\n"
+        "📈 История курсов\n"
+        "Показывает историю безналичной продажи RUB по банкам за выбранную дату или период. "
+        "Бот считает лучший средний курс, минимальный и максимальный курс за период, "
+        "а также средний спред к НБКР в процентах.\n\n"
+        "Примеры периода для истории:\n"
+        "12.06.2026\n"
+        "01.06.2026-12.06.2026\n"
+        "последние 7 дней\n"
+        "последние 30 дней\n\n"
         "🔔 Подписаться на рассылку\n"
-        "Включает автоматические уведомления по курсам. "
-        "Рассылка приходит в будние дни по Бишкекскому времени: 07:00, 09:00, 11:00, 13:00, 15:00 и 17:00.\n\n"
-        "🔕 Отписаться\n"
-        "Отключает автоматические уведомления по курсам.\n\n"
-        "❓ Помощь\n"
-        "Показывает описание кнопок, команд и логики расчёта.\n\n"
-        "Команды:\n"
-        "/start — открыть главное меню\n"
-        "/rates — показать текущие курсы и лучший банк сейчас\n"
-        "/calc — открыть калькулятор покупки RUB\n"
-        "/subscribe — подписаться на рассылку\n"
-        "/unsubscribe — отписаться от рассылки\n"
-        "/help — показать эту справку\n\n"
-        "Как пользоваться калькулятором:\n"
-        "1. Нажмите 🧮 Калькулятор или напишите /calc\n"
-        "2. Введите сумму RUB, которую нужно купить\n"
-        "3. Например: 1000000\n\n"
-        "Важно:\n"
-        "для покупки RUB за KGS выгоднее тот банк, у которого ниже курс продажи RUB."
+        "Бот будет присылать курсы по рабочим дням по времени Бишкека: "
+        "07:00, 09:00, 11:00, 13:00, 15:00, 17:00.\n\n"
+        "Важно: исторические данные используются для анализа рынка. "
+        "Фактическая возможность конвертации зависит от банка, лимитов, ликвидности и доступности курса."
     )
 
-    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(chat_id),
+    )
 
 
 async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
-
+    context.user_data.pop("mode", None)
     track_user(update, "rates")
 
-    rates_data = await get_rates_async()
-    sync_rates_log_to_google("manual_rates", rates_data)
-
-    best_info = get_best_bank_by_rate(rates_data)
-    now = now_bishkek_short()
-
-    if best_info["best_bank"] == "Курсы равны":
-        conclusion = "Курсы банков равны. Существенной разницы сейчас нет."
-    else:
-        conclusion = (
-            f"Сейчас выгоднее покупать RUB через {best_info['best_bank']}, "
-            "потому что курс продажи RUB ниже."
-        )
-
-    bakai_spread_abs = rates_data["bakai"] - rates_data["nbkr"]
-    aiyl_spread_abs = rates_data["aiyl"] - rates_data["nbkr"]
-
-    bakai_spread_pct = ((rates_data["bakai"] / rates_data["nbkr"]) - 1) * 100
-    aiyl_spread_pct = ((rates_data["aiyl"] / rates_data["nbkr"]) - 1) * 100
-
-    message = (
-        "Текущие курсы RUB / KGS\n"
-        "Тип курса: безналичная продажа RUB\n"
-        f"Дата и время: {now} Бишкек\n\n"
-        f"Бакай Банк: {format_rate(rates_data['bakai'])}\n"
-        f"Айыл Банк / A-bank: {format_rate(rates_data['aiyl'])}\n"
-        f"НБКР: {format_rate(rates_data['nbkr'])}\n\n"
-        f"Лучший банк сейчас: {best_info['best_bank']}\n\n"
-        "Разница между банками:\n"
-        f"{format_rate(best_info['absolute_difference'])} KGS за 1 RUB / "
-        f"{format_number(best_info['percent_difference'], 2)}%\n\n"
-        "Спред к НБКР за 1 RUB:\n"
-        f"Бакай Банк: {format_rate(bakai_spread_abs)} KGS / "
-        f"{format_number(bakai_spread_pct, 2)}%\n"
-        f"Айыл Банк / A-bank: {format_rate(aiyl_spread_abs)} KGS / "
-        f"{format_number(aiyl_spread_pct, 2)}%\n\n"
-        "Комментарий:\n"
-        f"{conclusion}\n\n"
-        f"{rates_data['source_status']}"
+    rates_data = collect_current_rates()
+    sync_rates_log(
+        source_type="manual",
+        bakai_rate=rates_data.get("bakai_rate"),
+        aiyl_rate=rates_data.get("aiyl_rate"),
+        nbkr_rate=rates_data.get("nbkr_rate"),
     )
 
-    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
-
-
-async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await send_typing(update, context)
-
-    track_user(update, "calc_start")
-
-    target_rub = parse_target_rub_from_command(context)
-
-    if target_rub is not None:
-        rates_data = await get_rates_async()
-        sync_rates_log_to_google("calculator_command", rates_data)
-
-        result = calculate_purchase_cost(target_rub, rates_data)
-        message = build_calculator_message(result, rates_data["source_status"])
-        await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
-        return ConversationHandler.END
+    chat_id = update.effective_chat.id if update.effective_chat else None
 
     await update.message.reply_text(
-        "Калькулятор покупки RUB за KGS\n\n"
-        "Введите сумму RUB, которую нужно купить.\n\n"
-        "Пример:\n"
-        "1000000\n\n"
-        "Для отмены напишите /cancel.",
-        reply_markup=keyboard_for_update(update),
+        build_rates_message(rates_data),
+        reply_markup=main_keyboard(chat_id),
     )
 
-    return WAITING_FOR_RUB_AMOUNT
+
+async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+    context.user_data["mode"] = "calc"
+    track_user(update, "calc_start")
+
+    await update.message.reply_text(
+        "Введите сумму RUB, которую нужно купить.\n\nНапример:\n1000000",
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
 
 
-async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+    text = update.message.text or ""
+    amount = parse_float(text)
+
+    if not amount or amount <= 0:
+        await update.message.reply_text(
+            "Не удалось распознать сумму. Введите число, например: 1000000",
+            reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+        )
+        return
+
+    track_user(update, "calc_amount")
+
+    rates_data = collect_current_rates()
+
+    lines = []
+    lines.append(f"🧮 Расчёт покупки RUB")
+    lines.append(f"Сумма: {fmt_money(amount)} RUB")
+    lines.append("")
+
+    bank_rates = []
+    if rates_data.get("bakai_rate"):
+        bank_rates.append(("Бакай Банк", rates_data["bakai_rate"]))
+    if rates_data.get("aiyl_rate"):
+        bank_rates.append(("Айыл Банк / A-bank", rates_data["aiyl_rate"]))
+
+    if not bank_rates:
+        lines.append("Не удалось получить доступные курсы банков.")
+    else:
+        for bank_name, rate in bank_rates:
+            kgs_needed = amount * rate
+            lines.append(f"{bank_name}:")
+            lines.append(f"курс: {fmt_rate(rate)}")
+            lines.append(f"потребуется: {fmt_money(kgs_needed)} KGS")
+            lines.append("")
+
+        best_bank, best_rate = min(bank_rates, key=lambda x: x[1])
+        lines.append(f"Лучший вариант: {best_bank} — {fmt_rate(best_rate)}")
+
+    nbkr_rate = rates_data.get("nbkr_rate")
+    if nbkr_rate:
+        lines.append("")
+        lines.append(f"Ориентир НБКР: {fmt_rate(nbkr_rate)}")
+
+    context.user_data.pop("mode", None)
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
+
+
+async def history_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+    context.user_data["mode"] = "history"
+    track_user(update, "history_start")
+
+    text = (
+        "Введите дату или период для анализа.\n\n"
+        "Примеры:\n"
+        "12.06.2026\n"
+        "01.06.2026-12.06.2026\n"
+        "последние 7 дней\n"
+        "последние 30 дней\n\n"
+        f"Максимальный период: {MAX_HISTORY_DAYS} дней."
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
+
+
+async def history_period_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
 
-    track_user(update, "calc_amount_received")
+    text = update.message.text or ""
+    start_period, end_period, error = parse_history_period(text)
 
-    target_rub = parse_amount_text(update.message.text)
-
-    if target_rub is None:
+    if error:
         await update.message.reply_text(
-            "Не удалось распознать сумму.\n\n"
-            "Введите только сумму RUB числом, например:\n"
-            "1000000\n\n"
-            "Для отмены напишите /cancel.",
-            reply_markup=keyboard_for_update(update),
+            error,
+            reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
         )
-        return WAITING_FOR_RUB_AMOUNT
+        return
 
-    rates_data = await get_rates_async()
-    sync_rates_log_to_google("calculator", rates_data)
+    if not start_period or not end_period:
+        await update.message.reply_text(
+            "Не удалось распознать период.",
+            reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+        )
+        return
 
-    result = calculate_purchase_cost(target_rub, rates_data)
-    message = build_calculator_message(result, rates_data["source_status"])
+    track_user(update, "history")
 
-    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
-    return ConversationHandler.END
+    await update.message.reply_text(
+        "Собираю исторические данные по банкам и считаю спред к НБКР. Это может занять немного времени.",
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
+
+    await send_typing(update, context)
+
+    try:
+        message = get_history_analysis(start_period, end_period)
+    except Exception as exc:
+        logging.exception("Ошибка исторического анализа: %s", exc)
+        message = (
+            "Не удалось выполнить исторический анализ.\n\n"
+            "Возможные причины: banks.kg временно не отвечает, изменился формат данных "
+            "или выбран слишком большой период."
+        )
+
+    context.user_data.pop("mode", None)
+
+    await update.message.reply_text(
+        message,
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
+    context.user_data.pop("mode", None)
 
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
+    if not chat:
+        return
 
-    already_subscribed = is_user_subscribed(chat_id)
+    already_subscribed = is_user_subscribed(chat.id)
 
-    add_subscriber(chat_id)
+    add_subscriber(chat.id)
     sync_subscriber_update(update, True)
     track_user(update, "subscribe")
 
-    if not already_subscribed:
-        message = (
-            "Готово, вы подписаны на рассылку курсов.\n\n"
-            "Уведомления будут приходить в будние дни по Бишкекскому времени:\n"
-            "07:00, 09:00, 11:00, 13:00, 15:00 и 17:00.\n\n"
-            "Чтобы отключить рассылку, нажмите 🔕 Отписаться или напишите /unsubscribe."
-        )
+    if already_subscribed:
+        text = "Вы уже подписаны на рассылку курсов."
     else:
-        message = (
-            "Вы уже подписаны на рассылку курсов.\n\n"
-            "Уведомления приходят в будние дни по Бишкекскому времени:\n"
-            "07:00, 09:00, 11:00, 13:00, 15:00 и 17:00."
+        text = (
+            "Готово, вы подписаны на рассылку курсов.\n\n"
+            "Бот будет присылать курсы по рабочим дням по времени Бишкека: "
+            "07:00, 09:00, 11:00, 13:00, 15:00, 17:00."
         )
 
-    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(chat.id),
+    )
 
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
+    context.user_data.pop("mode", None)
 
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
+    if not chat:
+        return
 
-    was_subscribed = is_user_subscribed(chat_id)
-
-    remove_subscriber(chat_id)
+    remove_subscriber(chat.id)
     sync_subscriber_update(update, False)
     track_user(update, "unsubscribe")
 
-    if was_subscribed:
-        message = "Готово, рассылка отключена."
-    else:
-        message = "Вы не были подписаны на рассылку."
-
-    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
+    await update.message.reply_text(
+        "Готово, вы отписаны от рассылки.",
+        reply_markup=main_keyboard(chat.id),
+    )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    track_user(update, "cancel")
-
-    await update.message.reply_text("Калькулятор закрыт.", reply_markup=keyboard_for_update(update))
-    return ConversationHandler.END
-
-
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_users_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
+    context.user_data.pop("mode", None)
 
-    track_user(update, "buy")
+    chat = update.effective_chat
+    if not chat:
+        return
 
-    target_rub = parse_target_rub_from_command(context)
-
-    if target_rub is None:
+    if chat.id != ADMIN_CHAT_ID:
         await update.message.reply_text(
-            "Для расчёта используйте калькулятор:\n"
-            "/calc",
-            reply_markup=keyboard_for_update(update),
+            "Не понял команду.\n\nВыберите действие кнопкой ниже или напишите /help.",
+            reply_markup=main_keyboard(chat.id),
         )
         return
 
-    rates_data = await get_rates_async()
-    sync_rates_log_to_google("buy_command", rates_data)
-
-    result = calculate_purchase_cost(target_rub, rates_data)
-    message = build_calculator_message(result, rates_data["source_status"])
-
-    await update.message.reply_text(message, reply_markup=keyboard_for_update(update))
-
-
-async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    now = datetime.now(BISHKEK_TZ)
-
-    if now.weekday() >= 5:
-        return
-
-    if now.hour not in NOTIFICATION_HOURS:
-        return
-
-    if now.minute > 4:
-        return
-
-    notification_key = now.strftime("%Y-%m-%d-%H")
-
-    if notification_key in SENT_NOTIFICATION_KEYS:
-        return
-
-    SENT_NOTIFICATION_KEYS.add(notification_key)
+    track_user(update, "users")
 
     subscribers = get_effective_subscribers()
 
+    text = (
+        "👥 Пользователи\n\n"
+        f"Подписчиков на рассылку: {len(subscribers)}\n\n"
+        "Ваш статус:\n"
+        f"chat_id: {chat.id}\n"
+        f"рассылка: {'да' if chat.id in subscribers else 'нет'}"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(chat.id),
+    )
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_users_to_admin(update, context)
+
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await rates(update, context)
+
+
+async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await rates(update, context)
+
+
+async def compare_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await rates(update, context)
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("mode", None)
+    track_user(update, "unknown_command")
+
+    await update.message.reply_text(
+        "Не понял команду.\n\nВыберите действие кнопкой ниже или напишите /help.",
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
+    if text == BTN_RATES:
+        await rates(update, context)
+        return
+
+    if text == BTN_CALC:
+        await calc_start(update, context)
+        return
+
+    if text == BTN_HISTORY:
+        await history_start(update, context)
+        return
+
+    if text == BTN_SUBSCRIBE:
+        await subscribe(update, context)
+        return
+
+    if text == BTN_UNSUBSCRIBE:
+        await unsubscribe(update, context)
+        return
+
+    if text == BTN_HELP:
+        await help_command(update, context)
+        return
+
+    if text == BTN_USERS:
+        await show_users_to_admin(update, context)
+        return
+
+    mode = context.user_data.get("mode")
+
+    if mode == "calc":
+        await calc_amount_received(update, context)
+        return
+
+    if mode == "history":
+        await history_period_received(update, context)
+        return
+
+    await update.message.reply_text(
+        "Не понял сообщение.\n\nВыберите действие кнопкой ниже или напишите /help.",
+        reply_markup=main_keyboard(chat_id),
+    )
+
+
+# =========================
+# АВТОМАТИЧЕСКАЯ РАССЫЛКА
+# =========================
+
+async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    current = now_bishkek()
+
+    # Только рабочие дни: понедельник-пятница.
+    if current.weekday() >= 5:
+        return
+
+    if current.hour not in SCHEDULE_HOURS_BISHKEK:
+        return
+
+    # Защита от пропуска из-за неидеального таймера Railway/job_queue.
+    if current.minute > 4:
+        return
+
+    send_key = f"{current.strftime('%Y-%m-%d')}-{current.hour}"
+
+    if send_key in SENT_NOTIFICATION_KEYS:
+        return
+
+    SENT_NOTIFICATION_KEYS.add(send_key)
+
+    subscribers = get_effective_subscribers()
     if not subscribers:
         return
 
-    rates_data = await get_rates_async()
-    sync_rates_log_to_google("scheduled_notification", rates_data)
+    rates_data = collect_current_rates()
+    sync_rates_log(
+        source_type="scheduled",
+        bakai_rate=rates_data.get("bakai_rate"),
+        aiyl_rate=rates_data.get("aiyl_rate"),
+        nbkr_rate=rates_data.get("nbkr_rate"),
+    )
 
-    message = build_notification_message(rates_data)
+    message = "🔔 Плановая рассылка курсов\n\n" + build_rates_message(rates_data)
 
     for chat_id in subscribers:
         try:
@@ -1304,136 +1452,46 @@ async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=main_keyboard(chat_id),
             )
         except Exception as exc:
-            logging.exception("Ошибка отправки уведомления chat_id=%s: %s", chat_id, exc)
+            logging.exception("Не удалось отправить рассылку chat_id=%s: %s", chat_id, exc)
 
 
-async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip().lower()
-
-    if text in [
-        "📊 курсы сейчас",
-        "курсы",
-        "курс",
-        "курс сейчас",
-        "текущие курсы",
-        "какой банк выгоднее",
-        "сравни курс",
-        "сравни курс сейчас",
-    ]:
-        await rates(update, context)
-        return
-
-    if text in [
-        "🧮 калькулятор",
-        "калькулятор",
-        "рассчитать",
-        "расчет",
-        "расчёт",
-        "купить rub",
-        "купить рубли",
-    ]:
-        await calc_start(update, context)
-        return
-
-    if text in [
-        "🔔 подписаться на рассылку",
-        "подписаться",
-        "подписка",
-        "включить рассылку",
-    ]:
-        await subscribe(update, context)
-        return
-
-    if text in [
-        "🔕 отписаться",
-        "отписаться",
-        "отключить рассылку",
-        "убрать рассылку",
-    ]:
-        await unsubscribe(update, context)
-        return
-
-    if text in [
-        "👥 пользователи",
-        "пользователи",
-    ]:
-        if is_admin(update):
-            track_user(update, "users_button")
-            await show_users_to_admin(update, context)
-            return
-
-        track_user(update, "unknown_text_users_button")
-
-        await update.message.reply_text(
-            "Не понял команду.\n\n"
-            "Выберите действие кнопкой ниже или напишите /help.",
-            reply_markup=keyboard_for_update(update),
-        )
-        return
-
-    if text in [
-        "❓ помощь",
-        "помощь",
-        "help",
-    ]:
-        await help_command(update, context)
-        return
-
-    track_user(update, "unknown_text")
-
-    await update.message.reply_text(
-        "Не понял команду.\n\n"
-        "Выберите действие кнопкой ниже или напишите /help.",
-        reply_markup=keyboard_for_update(update),
-    )
-
+# =========================
+# ЗАПУСК
+# =========================
 
 def main() -> None:
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
 
-    if not bot_token:
-        raise RuntimeError(
-            "Не найден TELEGRAM_BOT_TOKEN. "
-            "Добавьте токен Telegram-бота в переменные Railway."
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("rates", rates))
+    application.add_handler(CommandHandler("calc", calc_start))
+    application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    application.add_handler(CommandHandler("users", users_command))
+
+    # Скрытые быстрые команды.
+    application.add_handler(CommandHandler("buy", buy))
+    application.add_handler(CommandHandler("compare", compare))
+    application.add_handler(CommandHandler("compare_now", compare_now))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            scheduled_rates_job,
+            interval=60,
+            first=10,
         )
+    else:
+        logging.warning("Job queue недоступен. Проверь requirements.txt: python-telegram-bot[job-queue]==21.6")
 
-    app = Application.builder().token(bot_token).build()
-
-    calc_conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("calc", calc_start),
-            MessageHandler(filters.Regex("^🧮 Калькулятор$"), calc_start),
-        ],
-        states={
-            WAITING_FOR_RUB_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, calc_amount_received)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("rates", rates))
-    app.add_handler(CommandHandler("subscribe", subscribe))
-    app.add_handler(CommandHandler("unsubscribe", unsubscribe))
-    app.add_handler(CommandHandler("users", users_command))
-    app.add_handler(calc_conversation)
-
-    app.add_handler(CommandHandler("buy", buy))
-    app.add_handler(CommandHandler("compare", buy))
-    app.add_handler(CommandHandler("compare_now", buy))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_buttons))
-
-    app.job_queue.run_repeating(
-        scheduled_rates_job,
-        interval=60,
-        first=10,
-        name="scheduled_rates_notifications",
-    )
-
-    app.run_polling()
+    logging.info("Бот запущен")
+    application.run_polling()
 
 
 if __name__ == "__main__":

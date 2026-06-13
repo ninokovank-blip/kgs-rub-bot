@@ -9,7 +9,6 @@ from xml.etree import ElementTree as ET
 
 import requests
 from telegram import ReplyKeyboardMarkup, Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -76,6 +75,7 @@ HISTORY_BANKS = [
 BTN_RATES = "📊 Курсы сейчас"
 BTN_CALC = "🧮 Калькулятор"
 BTN_HISTORY = "📈 История курсов"
+BTN_BANK_HISTORY = "🏦 История по банку"
 BTN_SUBSCRIBE = "🔔 Подписаться на рассылку"
 BTN_UNSUBSCRIBE = "🔕 Отписаться"
 BTN_HELP = "❓ Помощь"
@@ -85,7 +85,7 @@ BTN_USERS = "👥 Пользователи"
 def main_keyboard(chat_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     rows = [
         [BTN_RATES, BTN_CALC],
-        [BTN_HISTORY],
+        [BTN_HISTORY, BTN_BANK_HISTORY],
         [BTN_SUBSCRIBE, BTN_UNSUBSCRIBE],
         [BTN_HELP],
     ]
@@ -437,8 +437,6 @@ def get_bakai_rate() -> Tuple[Optional[float], str]:
         return None, "Бакай Банк: не удалось получить данные"
 
     try:
-        # На сайте Бакай данные часто лежат в Next.js/JSON-фрагментах.
-        # Ищем блок RUB -> non_cash -> sell максимально гибко.
         patterns = [
             r'"RUB".{0,2000}?"non_cash".{0,1000}?"sell"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
             r'"rub".{0,2000}?"non_cash".{0,1000}?"sell"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
@@ -503,8 +501,6 @@ def get_aiyl_rate() -> Tuple[Optional[float], str]:
         text = re.sub(r"<[^>]+>", " ", html)
         text = re.sub(r"\s+", " ", text)
 
-        # Ищем участки рядом с RUB. У A-bank структура может меняться,
-        # поэтому берём наиболее вероятный второй числовой показатель после RUB как продажу.
         rub_positions = [m.start() for m in re.finditer(r"\bRUB\b|Руб", text, re.IGNORECASE)]
 
         candidates = []
@@ -520,7 +516,6 @@ def get_aiyl_rate() -> Tuple[Optional[float], str]:
         if not candidates:
             return None, "Айыл Банк / A-bank: курс RUB / безналичная продажа не найден"
 
-        # Для безналичной продажи в текущей логике берём наиболее вероятный sell.
         rate = candidates[-1]
 
         date_match = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
@@ -607,7 +602,6 @@ def parse_bankskg_timestamp(value: Any) -> Optional[datetime]:
     if value is None:
         return None
 
-    # Часто графики отдают timestamp в миллисекундах.
     if isinstance(value, (int, float)):
         try:
             numeric = float(value)
@@ -621,7 +615,6 @@ def parse_bankskg_timestamp(value: Any) -> Optional[datetime]:
     if not text:
         return None
 
-    # Числовой timestamp строкой.
     if re.fullmatch(r"\d+(\.\d+)?", text):
         try:
             numeric = float(text)
@@ -631,7 +624,6 @@ def parse_bankskg_timestamp(value: Any) -> Optional[datetime]:
         except Exception:
             pass
 
-    # ISO / обычная дата.
     for fmt in (
         "%Y-%m-%dT%H:%M:%S.%fZ",
         "%Y-%m-%dT%H:%M:%SZ",
@@ -653,10 +645,7 @@ def parse_bankskg_timestamp(value: Any) -> Optional[datetime]:
 def normalize_history_points(raw_points: Any) -> List[Dict[str, Any]]:
     result = []
 
-    if not raw_points:
-        return result
-
-    if not isinstance(raw_points, list):
+    if not raw_points or not isinstance(raw_points, list):
         return result
 
     for item in raw_points:
@@ -668,7 +657,6 @@ def normalize_history_points(raw_points: Any) -> List[Dict[str, Any]]:
             rate = parse_float(item[1])
 
         elif isinstance(item, dict):
-            # Поддерживаем несколько возможных форматов.
             dt_value = (
                 item.get("date")
                 or item.get("datetime")
@@ -720,8 +708,6 @@ def fetch_bank_history_from_bankskg(organization_id: int) -> Dict[str, Any]:
         logging.exception("Ошибка banks.kg для organization_id=%s: %s", organization_id, exc)
         return {"buy": [], "sell": []}
 
-    # Ожидаемый вариант: {"buy": [...], "sell": [...]}
-    # Но делаем гибко на случай вложенности.
     if isinstance(data, dict):
         if "buy" in data or "sell" in data:
             return {
@@ -792,6 +778,95 @@ def parse_history_period(text: str) -> Tuple[Optional[datetime], Optional[dateti
     )
 
 
+def normalize_bank_search_text(text: str) -> str:
+    return (
+        text.lower()
+        .replace("ё", "е")
+        .replace('"', "")
+        .replace("«", "")
+        .replace("»", "")
+        .replace("!", "")
+        .strip()
+    )
+
+
+def find_history_bank(text: str) -> Optional[Dict[str, Any]]:
+    normalized = normalize_bank_search_text(text)
+
+    if normalized.isdigit():
+        bank_id = int(normalized)
+        for bank in HISTORY_BANKS:
+            if bank["id"] == bank_id:
+                return bank
+
+    aliases = {
+        "мбанк": "MBANK",
+        "mbank": "MBANK",
+        "м банк": "MBANK",
+        "обанк": "O!Bank",
+        "o bank": "O!Bank",
+        "obank": "O!Bank",
+        "о банк": "O!Bank",
+        "абанк": "АБанк",
+        "a bank": "АБанк",
+        "abank": "АБанк",
+        "а банк": "АБанк",
+        "бакай": "Бакай Банк",
+        "оптима": "Оптима Банк",
+        "кикб": "КИКБ",
+        "бки": "КИКБ",
+        "kicb": "КИКБ",
+        "элдик": "Элдик банк",
+        "керемет": "Керемет Банк",
+        "демир": "Демир банк",
+        "банк азии": "Банк Азии",
+        "компаньон": "Банк Компаньон",
+        "бай тушум": 'Банк "Бай Тушум"',
+        "толубай": "Толубай Банк",
+        "дос кредо": "Дос-Кредобанк",
+        "дос-кредо": "Дос-Кредобанк",
+        "финка": "ФИНКА Банк",
+        "капитал": "Капитал Банк",
+        "ксб": "Коммерческий Банк КСБ",
+        "евразийский": "Евразийский Сберегательный Банк",
+        "финанскредит": "ФинансКредитБанк",
+        "финанс кредит": "ФинансКредитБанк",
+    }
+
+    for alias, bank_name in aliases.items():
+        if alias in normalized:
+            for bank in HISTORY_BANKS:
+                if bank["name"] == bank_name:
+                    return bank
+
+    for bank in HISTORY_BANKS:
+        bank_name_normalized = normalize_bank_search_text(bank["name"])
+        if normalized in bank_name_normalized or bank_name_normalized in normalized:
+            return bank
+
+    return None
+
+
+def build_bank_selection_message() -> str:
+    lines = []
+    lines.append("Выберите банк для анализа.")
+    lines.append("")
+    lines.append("Можно написать номер или название банка.")
+    lines.append("")
+
+    for bank in HISTORY_BANKS:
+        lines.append(f"{bank['id']} — {bank['name']}")
+
+    lines.append("")
+    lines.append("Примеры:")
+    lines.append("5")
+    lines.append("MBANK")
+    lines.append("Бакай")
+    lines.append("КИКБ")
+
+    return "\n".join(lines)
+
+
 def get_nbkr_history_rates(start: datetime, end: datetime) -> Dict[Any, float]:
     result = {}
     current = start
@@ -857,9 +932,7 @@ def build_top_lines(
 
     lines = []
     for index, item in enumerate(sorted_items[:limit], start=1):
-        lines.append(
-            f"{index}. {item['bank_name']} — {value_formatter(item[key])}"
-        )
+        lines.append(f"{index}. {item['bank_name']} — {value_formatter(item[key])}")
 
     return lines
 
@@ -885,7 +958,6 @@ def build_history_message(
         lines.append("За выбранный период данные по банкам не найдены.")
         return "\n".join(lines)
 
-    # Основной рейтинг: чем ниже средний sell, тем лучше.
     lines.append("Лучший средний курс:")
     lines.extend(build_top_lines(summaries, "avg_sell_rate", reverse=False, value_formatter=fmt_rate, limit=5))
     lines.append("")
@@ -953,13 +1025,10 @@ def build_history_message(
         )
 
     comment += " Данные приведены для анализа рынка."
-
     lines.append(comment)
 
     message = "\n".join(lines)
 
-    # Telegram имеет лимит 4096 символов.
-    # Если банков много и сообщение длинное, режем детализацию, но сохраняем основные рейтинги.
     if len(message) <= 3900:
         return message
 
@@ -1034,6 +1103,137 @@ def get_history_analysis(start: datetime, end: datetime) -> str:
     return build_history_message(start, end, summaries, no_data_banks)
 
 
+def build_single_bank_history_message(
+    selected_bank: Dict[str, Any],
+    start: datetime,
+    end: datetime,
+) -> str:
+    nbkr_rates_by_date = get_nbkr_history_rates(start, end)
+
+    selected_history = fetch_bank_history_from_bankskg(selected_bank["id"])
+    selected_summary = calculate_bank_history_summary(
+        bank_name=selected_bank["name"],
+        organization_id=selected_bank["id"],
+        sell_points=selected_history.get("sell", []),
+        nbkr_rates_by_date=nbkr_rates_by_date,
+        start=start,
+        end=end,
+    )
+
+    period_text = (
+        format_date(start)
+        if start.date() == end.date()
+        else f"{format_date(start)}–{format_date(end)}"
+    )
+
+    if not selected_summary:
+        return (
+            f"🏦 {selected_bank['name']}\n"
+            f"История RUB / KGS за {period_text}\n"
+            "Тип курса: безналичная продажа RUB\n\n"
+            "За выбранный период данные по этому банку не найдены."
+        )
+
+    market_summaries = []
+
+    for bank in HISTORY_BANKS:
+        history = fetch_bank_history_from_bankskg(bank["id"])
+        summary = calculate_bank_history_summary(
+            bank_name=bank["name"],
+            organization_id=bank["id"],
+            sell_points=history.get("sell", []),
+            nbkr_rates_by_date=nbkr_rates_by_date,
+            start=start,
+            end=end,
+        )
+        if summary:
+            market_summaries.append(summary)
+
+    def get_rank(
+        items: List[Dict[str, Any]],
+        key: str,
+        bank_name: str,
+        reverse: bool = False,
+    ) -> Optional[int]:
+        valid = [item for item in items if item.get(key) is not None]
+        sorted_items = sorted(valid, key=lambda x: x[key], reverse=reverse)
+
+        for index, item in enumerate(sorted_items, start=1):
+            if item["bank_name"] == bank_name:
+                return index
+
+        return None
+
+    total_banks = len(market_summaries)
+
+    rank_avg = get_rank(
+        market_summaries,
+        "avg_sell_rate",
+        selected_bank["name"],
+        reverse=False,
+    )
+
+    rank_min = get_rank(
+        market_summaries,
+        "min_sell_rate",
+        selected_bank["name"],
+        reverse=False,
+    )
+
+    rank_spread = get_rank(
+        market_summaries,
+        "avg_spread_pct",
+        selected_bank["name"],
+        reverse=False,
+    )
+
+    lines = []
+    lines.append(f"🏦 {selected_bank['name']}")
+    lines.append(f"История RUB / KGS за {period_text}")
+    lines.append("Тип курса: безналичная продажа RUB")
+    lines.append("")
+
+    lines.append("Показатели банка:")
+    lines.append(f"средний курс: {fmt_rate(selected_summary['avg_sell_rate'])}")
+    lines.append(f"минимум: {fmt_rate(selected_summary['min_sell_rate'])}")
+    lines.append(f"максимум: {fmt_rate(selected_summary['max_sell_rate'])}")
+    lines.append(f"последний: {fmt_rate(selected_summary['last_sell_rate'])}")
+    lines.append(f"изменений курса: {selected_summary['rate_points_count']}")
+    lines.append("")
+
+    lines.append("Спред к НБКР:")
+    lines.append(f"средний: {fmt_pct(selected_summary['avg_spread_pct'])}")
+    lines.append(f"минимальный: {fmt_pct(selected_summary['min_spread_pct'])}")
+    lines.append(f"максимальный: {fmt_pct(selected_summary['max_spread_pct'])}")
+    lines.append("")
+
+    if total_banks:
+        lines.append("Позиция среди банков:")
+        if rank_avg:
+            lines.append(f"по среднему курсу: {rank_avg} из {total_banks}")
+        if rank_min:
+            lines.append(f"по минимальному курсу: {rank_min} из {total_banks}")
+        if rank_spread:
+            lines.append(f"по среднему спреду к НБКР: {rank_spread} из {total_banks}")
+        lines.append("")
+
+    comment = (
+        f"Комментарий:\n"
+        f"За выбранный период средний курс {selected_bank['name']} составил "
+        f"{fmt_rate(selected_summary['avg_sell_rate'])}, "
+        f"средний спред к НБКР — {fmt_pct(selected_summary['avg_spread_pct'])}."
+    )
+
+    if rank_avg and total_banks:
+        comment += f" По среднему курсу банк занял {rank_avg} место из {total_banks}."
+
+    comment += " Данные приведены для анализа рынка."
+
+    lines.append(comment)
+
+    return "\n".join(lines)
+
+
 # =========================
 # КОМАНДЫ И СЦЕНАРИИ
 # =========================
@@ -1041,6 +1241,7 @@ def get_history_analysis(start: datetime, end: datetime) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
     context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
     track_user(update, "start")
 
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -1061,6 +1262,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
     context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
     track_user(update, "help")
 
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -1077,6 +1279,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Показывает историю безналичной продажи RUB по банкам за выбранную дату или период. "
         "Бот считает лучший средний курс, минимальный и максимальный курс за период, "
         "а также средний спред к НБКР в процентах.\n\n"
+        "🏦 История по банку\n"
+        "Позволяет выбрать конкретный банк и посмотреть его исторический курс за дату или период. "
+        "Бот показывает средний, минимальный, максимальный и последний курс, "
+        "спред к НБКР, а также место банка среди остальных банков за выбранный период.\n\n"
         "Примеры периода для истории:\n"
         "12.06.2026\n"
         "01.06.2026-12.06.2026\n"
@@ -1098,6 +1304,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
     context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
     track_user(update, "rates")
 
     rates_data = collect_current_rates()
@@ -1119,6 +1326,7 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
     context.user_data["mode"] = "calc"
+    context.user_data.pop("selected_bank", None)
     track_user(update, "calc_start")
 
     await update.message.reply_text(
@@ -1144,7 +1352,7 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
     rates_data = collect_current_rates()
 
     lines = []
-    lines.append(f"🧮 Расчёт покупки RUB")
+    lines.append("🧮 Расчёт покупки RUB")
     lines.append(f"Сумма: {fmt_money(amount)} RUB")
     lines.append("")
 
@@ -1183,6 +1391,7 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
 async def history_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
     context.user_data["mode"] = "history"
+    context.user_data.pop("selected_bank", None)
     track_user(update, "history_start")
 
     text = (
@@ -1241,6 +1450,114 @@ async def history_period_received(update: Update, context: ContextTypes.DEFAULT_
         )
 
     context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
+
+    await update.message.reply_text(
+        message,
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
+
+
+async def bank_history_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+    context.user_data["mode"] = "bank_select"
+    context.user_data.pop("selected_bank", None)
+    track_user(update, "bank_history_start")
+
+    await update.message.reply_text(
+        build_bank_selection_message(),
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
+
+
+async def bank_selected_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+
+    text = update.message.text or ""
+    bank = find_history_bank(text)
+
+    if not bank:
+        await update.message.reply_text(
+            "Не удалось найти банк.\n\n"
+            "Напишите номер или название банка, например:\n"
+            "5\n"
+            "MBANK\n"
+            "Бакай\n"
+            "КИКБ",
+            reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+        )
+        return
+
+    context.user_data["selected_bank"] = bank
+    context.user_data["mode"] = "bank_period"
+
+    await update.message.reply_text(
+        f"Выбран банк: {bank['name']}.\n\n"
+        "Теперь введите дату или период для анализа.\n\n"
+        "Примеры:\n"
+        "12.06.2026\n"
+        "01.06.2026-12.06.2026\n"
+        "последние 7 дней\n"
+        "последние 30 дней",
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
+
+
+async def bank_period_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update, context)
+
+    selected_bank = context.user_data.get("selected_bank")
+    if not selected_bank:
+        context.user_data["mode"] = "bank_select"
+        await update.message.reply_text(
+            "Сначала выберите банк.",
+            reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+        )
+        return
+
+    text = update.message.text or ""
+    start_period, end_period, error = parse_history_period(text)
+
+    if error:
+        await update.message.reply_text(
+            error,
+            reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+        )
+        return
+
+    if not start_period or not end_period:
+        await update.message.reply_text(
+            "Не удалось распознать период.",
+            reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+        )
+        return
+
+    track_user(update, "bank_history")
+
+    await update.message.reply_text(
+        f"Собираю историю по банку {selected_bank['name']} и считаю позицию среди рынка. "
+        "Это может занять немного времени.",
+        reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
+    )
+
+    await send_typing(update, context)
+
+    try:
+        message = build_single_bank_history_message(
+            selected_bank=selected_bank,
+            start=start_period,
+            end=end_period,
+        )
+    except Exception as exc:
+        logging.exception("Ошибка анализа истории по банку: %s", exc)
+        message = (
+            "Не удалось выполнить анализ по банку.\n\n"
+            "Возможные причины: banks.kg временно не отвечает, изменился формат данных "
+            "или выбран слишком большой период."
+        )
+
+    context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
 
     await update.message.reply_text(
         message,
@@ -1251,6 +1568,7 @@ async def history_period_received(update: Update, context: ContextTypes.DEFAULT_
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
     context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
 
     chat = update.effective_chat
     if not chat:
@@ -1280,6 +1598,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
     context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
 
     chat = update.effective_chat
     if not chat:
@@ -1298,6 +1617,7 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def show_users_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update, context)
     context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
 
     chat = update.effective_chat
     if not chat:
@@ -1346,6 +1666,7 @@ async def compare_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("mode", None)
+    context.user_data.pop("selected_bank", None)
     track_user(update, "unknown_command")
 
     await update.message.reply_text(
@@ -1371,6 +1692,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if text == BTN_HISTORY:
         await history_start(update, context)
+        return
+
+    if text == BTN_BANK_HISTORY:
+        await bank_history_start(update, context)
         return
 
     if text == BTN_SUBSCRIBE:
@@ -1399,6 +1724,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await history_period_received(update, context)
         return
 
+    if mode == "bank_select":
+        await bank_selected_received(update, context)
+        return
+
+    if mode == "bank_period":
+        await bank_period_received(update, context)
+        return
+
     await update.message.reply_text(
         "Не понял сообщение.\n\nВыберите действие кнопкой ниже или напишите /help.",
         reply_markup=main_keyboard(chat_id),
@@ -1412,14 +1745,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def scheduled_rates_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     current = now_bishkek()
 
-    # Только рабочие дни: понедельник-пятница.
     if current.weekday() >= 5:
         return
 
     if current.hour not in SCHEDULE_HOURS_BISHKEK:
         return
 
-    # Защита от пропуска из-за неидеального таймера Railway/job_queue.
     if current.minute > 4:
         return
 
@@ -1473,7 +1804,6 @@ def main() -> None:
     application.add_handler(CommandHandler("unsubscribe", unsubscribe))
     application.add_handler(CommandHandler("users", users_command))
 
-    # Скрытые быстрые команды.
     application.add_handler(CommandHandler("buy", buy))
     application.add_handler(CommandHandler("compare", compare))
     application.add_handler(CommandHandler("compare_now", compare_now))
@@ -1488,7 +1818,10 @@ def main() -> None:
             first=10,
         )
     else:
-        logging.warning("Job queue недоступен. Проверь requirements.txt: python-telegram-bot[job-queue]==21.6")
+        logging.warning(
+            "Job queue недоступен. Проверь requirements.txt: "
+            "python-telegram-bot[job-queue]==21.6"
+        )
 
     logging.info("Бот запущен")
     application.run_polling()

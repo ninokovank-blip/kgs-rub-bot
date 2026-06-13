@@ -41,6 +41,14 @@ SENT_NOTIFICATION_KEYS = set()
 
 MAX_HISTORY_DAYS = 90
 
+# НБКР иногда отвечает медленно. Для бота лучше быстро вернуть анализ,
+# чем подвесить ответ на несколько минут.
+NBKR_TIMEOUT_SECONDS = 4
+NBKR_MAX_CONSECUTIVE_ERRORS = 3
+
+# Кэш только в рамках текущего запуска Railway.
+NBKR_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+
 # =========================
 # СПРАВОЧНИК БАНКОВ ДЛЯ ИСТОРИИ
 # =========================
@@ -68,11 +76,16 @@ HISTORY_BANKS = [
     {"id": 22, "name": "ФинансКредитБанк"},
 ]
 
+CURRENT_COMPARE_BANKS = [
+    {"id": 14, "name": "Бакай Банк"},
+    {"id": 12, "name": "АБанк"},
+]
+
 # =========================
 # КНОПКИ
 # =========================
 
-BTN_RATES = "📊 Курсы сейчас"
+BTN_RATES = "⚖️ Бакай / A-bank сейчас"
 BTN_CALC = "🧮 Калькулятор"
 BTN_HISTORY = "📈 История курсов"
 BTN_BANK_HISTORY = "🏦 История по банку"
@@ -182,7 +195,7 @@ def post_to_google(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         response = requests.post(
             GOOGLE_APPS_SCRIPT_URL,
             json=payload,
-            timeout=12,
+            timeout=8,
         )
     except Exception as exc:
         logging.exception("Google Sheets sync error: %s", exc)
@@ -246,7 +259,7 @@ def sync_rates_log(
     if bakai_rate:
         bank_rates.append(("Бакай Банк", bakai_rate))
     if aiyl_rate:
-        bank_rates.append(("Айыл Банк / A-bank", aiyl_rate))
+        bank_rates.append(("АБанк", aiyl_rate))
 
     if bank_rates:
         best_bank, best_rate = min(bank_rates, key=lambda x: x[1])
@@ -375,6 +388,14 @@ def get_effective_subscribers() -> List[int]:
     return load_subscribers()
 
 
+def is_user_subscribed_for_tracking(chat_id: int) -> bool:
+    """
+    Для фиксации действия пользователя не ходим в Google каждый раз.
+    Это ускоряет команды и не блокирует бота, если Apps Script временно отвечает с ошибкой.
+    """
+    return chat_id in load_subscribers()
+
+
 def is_user_subscribed(chat_id: int) -> bool:
     return chat_id in get_effective_subscribers()
 
@@ -384,8 +405,7 @@ def track_user(update: Update, action: str) -> None:
     if not chat:
         return
 
-    subscribed = is_user_subscribed(chat.id)
-    sync_user_activity(update, action, subscribed)
+    sync_user_activity(update, action, is_user_subscribed_for_tracking(chat.id))
 
 
 # =========================
@@ -393,10 +413,6 @@ def track_user(update: Update, action: str) -> None:
 # =========================
 
 def parse_nbkr_report_date(root: ET.Element) -> Optional[datetime]:
-    """
-    НБКР в XML обычно отдаёт дату отчёта в атрибуте Date.
-    Нам важно понимать, за какую дату реально пришёл курс.
-    """
     for attr_name in ("Date", "date"):
         raw_date = root.attrib.get(attr_name)
         if raw_date:
@@ -411,13 +427,8 @@ def parse_nbkr_report_date(root: ET.Element) -> Optional[datetime]:
 
 def get_nbkr_rate_with_actual_date(
     date_obj: Optional[datetime] = None,
+    timeout_seconds: int = NBKR_TIMEOUT_SECONDS,
 ) -> Tuple[Optional[float], str, Optional[datetime]]:
-    """
-    Возвращает:
-    1. курс RUB/KGS по НБКР;
-    2. текст источника;
-    3. фактическую дату курса, которую вернул НБКР.
-    """
     if date_obj is None:
         url = "https://www.nbkr.kg/XML/daily.xml"
     else:
@@ -425,16 +436,23 @@ def get_nbkr_rate_with_actual_date(
         url = f"https://www.nbkr.kg/XML/daily.xml?date_req={date_req}"
 
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(
+            url,
+            timeout=timeout_seconds,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/xml,text/xml,*/*",
+            },
+        )
         response.raise_for_status()
     except Exception as exc:
-        logging.exception("Ошибка получения курса НБКР: %s", exc)
+        logging.warning("НБКР не ответил по дате %s: %s", date_obj, exc)
         return None, "НБКР: не удалось получить данные", None
 
     try:
         root = ET.fromstring(response.content)
     except Exception as exc:
-        logging.exception("Ошибка разбора XML НБКР: %s", exc)
+        logging.warning("Ошибка разбора XML НБКР: %s", exc)
         return None, "НБКР: не удалось разобрать данные", None
 
     actual_date = parse_nbkr_report_date(root)
@@ -463,212 +481,65 @@ def get_nbkr_rate_with_actual_date(
 
 
 def get_nbkr_rate_for_date(date_obj: Optional[datetime] = None) -> Tuple[Optional[float], str]:
-    """
-    Совместимость со старой логикой текущих курсов.
-    """
     rate, source, _actual_date = get_nbkr_rate_with_actual_date(date_obj)
     return rate, source
 
 
-def get_nbkr_rate_for_history_date(
-    target_date: datetime,
-) -> Tuple[Optional[float], Optional[datetime]]:
+def get_nbkr_history_rates(start: datetime, end: datetime) -> Tuple[Dict[Any, Dict[str, Any]], bool]:
     """
-    Для истории берём курс НБКР на дату.
-    Если на дату нет курса из-за выходного/праздника, берём ближайший предыдущий доступный курс.
+    Быстрый и отказоустойчивый режим для истории.
+
+    Корректность:
+    - НБКР запрашивается на конкретную дату периода.
+    - Если XML НБКР сообщает фактическую дату курса, мы её сохраняем.
+    - Если НБКР не ответил, для этой даты спред не считается.
+    - Если НБКР не отвечает несколько раз подряд, бот прекращает запросы НБКР,
+      чтобы не зависать, и показывает банковскую историю без/с частичным спредом.
     """
-    for days_back in range(0, 10):
-        request_date = target_date - timedelta(days=days_back)
+    result: Dict[Any, Dict[str, Any]] = {}
+    current = start
+    consecutive_errors = 0
+    is_partial = False
 
-        rate, _source, actual_date = get_nbkr_rate_with_actual_date(request_date)
+    while current.date() <= end.date():
+        cache_key = current.strftime("%Y-%m-%d")
 
-        if not rate:
+        if cache_key in NBKR_CACHE:
+            cached = NBKR_CACHE[cache_key]
+            if cached:
+                result[current.date()] = cached
+            current += timedelta(days=1)
             continue
 
-        if actual_date is None:
-            return rate, request_date
+        rate, _source, actual_date = get_nbkr_rate_with_actual_date(current)
 
-        if actual_date.date() <= target_date.date():
-            return rate, actual_date
-
-    return None, None
-
-
-# =========================
-# ПАРСЕРЫ ТЕКУЩИХ КУРСОВ
-# =========================
-
-def get_bakai_rate() -> Tuple[Optional[float], str]:
-    url = "https://bakai.kg/"
-
-    try:
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        html = response.text
-    except Exception as exc:
-        logging.exception("Ошибка получения курса Бакай: %s", exc)
-        return None, "Бакай Банк: не удалось получить данные"
-
-    try:
-        patterns = [
-            r'"RUB".{0,2000}?"non_cash".{0,1000}?"sell"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
-            r'"rub".{0,2000}?"non_cash".{0,1000}?"sell"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
-            r'RUB.{0,2000}?non_cash.{0,1000}?sell.{0,50}?([0-9]+(?:[.,][0-9]+)?)',
-        ]
-
-        rate = None
-        for pattern in patterns:
-            match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
-            if match:
-                rate = parse_float(match.group(1))
-                if rate:
-                    break
-
-        if rate is None:
-            return None, "Бакай Банк: курс RUB / безналичная продажа не найден"
-
-        date_text = ""
-        date_match = re.search(
-            r'"last_execution"\s*:\s*"([^"]+)"',
-            html,
-            re.IGNORECASE,
-        )
-        if date_match:
-            raw = date_match.group(1)
-            try:
-                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                date_text = parsed.strftime("%d.%m.%Y %H:%M")
-            except Exception:
-                date_text = raw[:16]
-
-        if date_text:
-            source = (
-                "Бакай Банк: получен с официального сайта, "
-                f"тип курса: RUB / безналичная продажа, дата обновления на сайте: {date_text}"
-            )
+        if rate:
+            item = {
+                "rate": rate,
+                "actual_date": actual_date.date() if actual_date else current.date(),
+            }
+            NBKR_CACHE[cache_key] = item
+            result[current.date()] = item
+            consecutive_errors = 0
         else:
-            source = (
-                "Бакай Банк: получен с официального сайта, "
-                "тип курса: RUB / безналичная продажа"
-            )
+            NBKR_CACHE[cache_key] = None
+            consecutive_errors += 1
+            is_partial = True
 
-        return rate, source
+            if consecutive_errors >= NBKR_MAX_CONSECUTIVE_ERRORS:
+                logging.warning(
+                    "НБКР недоступен %s раз подряд. Прекращаем загрузку НБКР для истории.",
+                    consecutive_errors,
+                )
+                break
 
-    except Exception as exc:
-        logging.exception("Ошибка разбора курса Бакай: %s", exc)
-        return None, "Бакай Банк: ошибка разбора данных"
+        current += timedelta(days=1)
 
-
-def get_aiyl_rate() -> Tuple[Optional[float], str]:
-    url = "https://abank.kg/ky"
-
-    try:
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        html = response.text
-    except Exception as exc:
-        logging.exception("Ошибка получения курса A-bank: %s", exc)
-        return None, "Айыл Банк / A-bank: не удалось получить данные"
-
-    try:
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text)
-
-        rub_positions = [m.start() for m in re.finditer(r"\bRUB\b|Руб", text, re.IGNORECASE)]
-
-        candidates = []
-        for pos in rub_positions:
-            chunk = text[pos:pos + 500]
-            nums = re.findall(r"\d+[.,]\d+", chunk)
-            parsed_nums = [parse_float(x) for x in nums]
-            parsed_nums = [x for x in parsed_nums if x is not None]
-
-            if len(parsed_nums) >= 2:
-                candidates.append(parsed_nums[1])
-
-        if not candidates:
-            return None, "Айыл Банк / A-bank: курс RUB / безналичная продажа не найден"
-
-        rate = candidates[-1]
-
-        date_match = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
-        date_text = date_match.group(0) if date_match else ""
-
-        source = (
-            "Айыл Банк / A-bank: получен с официального сайта, "
-            "тип курса: безналичная продажа RUB"
-        )
-        if date_text:
-            source += f", дата на сайте: {date_text}"
-
-        return rate, source
-
-    except Exception as exc:
-        logging.exception("Ошибка разбора курса A-bank: %s", exc)
-        return None, "Айыл Банк / A-bank: ошибка разбора данных"
-
-
-def collect_current_rates() -> Dict[str, Any]:
-    bakai_rate, bakai_source = get_bakai_rate()
-    aiyl_rate, aiyl_source = get_aiyl_rate()
-    nbkr_rate, nbkr_source = get_nbkr_rate_for_date()
-
-    return {
-        "bakai_rate": bakai_rate,
-        "bakai_source": bakai_source,
-        "aiyl_rate": aiyl_rate,
-        "aiyl_source": aiyl_source,
-        "nbkr_rate": nbkr_rate,
-        "nbkr_source": nbkr_source,
-    }
-
-
-def build_rates_message(rates_data: Dict[str, Any]) -> str:
-    bakai_rate = rates_data.get("bakai_rate")
-    aiyl_rate = rates_data.get("aiyl_rate")
-    nbkr_rate = rates_data.get("nbkr_rate")
-
-    lines = []
-    lines.append("📊 Курсы RUB / KGS сейчас")
-    lines.append("Тип курса: безналичная продажа RUB")
-    lines.append("")
-
-    lines.append(f"Бакай Банк: {fmt_rate(bakai_rate)}")
-    lines.append(f"Айыл Банк / A-bank: {fmt_rate(aiyl_rate)}")
-    lines.append(f"НБКР: {fmt_rate(nbkr_rate)}")
-    lines.append("")
-
-    available_banks = []
-    if bakai_rate:
-        available_banks.append(("Бакай Банк", bakai_rate))
-    if aiyl_rate:
-        available_banks.append(("Айыл Банк / A-bank", aiyl_rate))
-
-    if available_banks:
-        best_bank, best_rate = min(available_banks, key=lambda x: x[1])
-        lines.append(f"Лучший курс сейчас: {best_bank} — {fmt_rate(best_rate)}")
-        lines.append("")
-
-    if nbkr_rate:
-        lines.append("Спред к НБКР:")
-        if bakai_rate:
-            spread = (bakai_rate / nbkr_rate - 1) * 100
-            lines.append(f"Бакай Банк: {fmt_pct(spread)}")
-        if aiyl_rate:
-            spread = (aiyl_rate / nbkr_rate - 1) * 100
-            lines.append(f"Айыл Банк / A-bank: {fmt_pct(spread)}")
-        lines.append("")
-
-    lines.append("Источники:")
-    lines.append(f"• {rates_data.get('bakai_source')}")
-    lines.append(f"• {rates_data.get('aiyl_source')}")
-    lines.append(f"• {rates_data.get('nbkr_source')}")
-
-    return "\n".join(lines)
+    return result, is_partial
 
 
 # =========================
-# ИСТОРИЯ BANKS.KG
+# BANKS.KG
 # =========================
 
 def parse_bankskg_timestamp(value: Any) -> Optional[datetime]:
@@ -774,11 +645,11 @@ def fetch_bank_history_from_bankskg(organization_id: int) -> Dict[str, Any]:
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=20)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
-        logging.exception("Ошибка banks.kg для organization_id=%s: %s", organization_id, exc)
+        logging.warning("Ошибка banks.kg для organization_id=%s: %s", organization_id, exc)
         return {"buy": [], "sell": []}
 
     if isinstance(data, dict):
@@ -798,6 +669,91 @@ def fetch_bank_history_from_bankskg(organization_id: int) -> Dict[str, Any]:
 
     return {"buy": [], "sell": []}
 
+
+def get_latest_bankskg_cashless_sell(organization_id: int) -> Tuple[Optional[float], str]:
+    history = fetch_bank_history_from_bankskg(organization_id)
+    sell_points = history.get("sell", [])
+
+    if not sell_points:
+        return None, "banks.kg: курс RUB / безналичная продажа не найден"
+
+    latest_point = max(sell_points, key=lambda x: x["datetime"])
+    rate = latest_point["rate"]
+    date_text = latest_point["datetime"].strftime("%d.%m.%Y %H:%M")
+
+    return rate, f"banks.kg: RUB / безналичная продажа, последняя точка: {date_text}"
+
+
+# =========================
+# ТЕКУЩЕЕ СРАВНЕНИЕ БАКАЙ / A-BANK
+# =========================
+
+def collect_current_rates() -> Dict[str, Any]:
+    # Для текущего сравнения Бакай / A-bank используем banks.kg по обоим банкам,
+    # чтобы источник и тип курса были сопоставимыми.
+    bakai_rate, bakai_source = get_latest_bankskg_cashless_sell(14)
+    aiyl_rate, aiyl_source = get_latest_bankskg_cashless_sell(12)
+    nbkr_rate, nbkr_source = get_nbkr_rate_for_date()
+
+    return {
+        "bakai_rate": bakai_rate,
+        "bakai_source": "Бакай Банк — " + bakai_source,
+        "aiyl_rate": aiyl_rate,
+        "aiyl_source": "АБанк — " + aiyl_source,
+        "nbkr_rate": nbkr_rate,
+        "nbkr_source": nbkr_source,
+    }
+
+
+def build_rates_message(rates_data: Dict[str, Any]) -> str:
+    bakai_rate = rates_data.get("bakai_rate")
+    aiyl_rate = rates_data.get("aiyl_rate")
+    nbkr_rate = rates_data.get("nbkr_rate")
+
+    lines = []
+    lines.append("⚖️ Бакай / A-bank сейчас")
+    lines.append("Тип курса: безналичная продажа RUB")
+    lines.append("")
+
+    lines.append(f"Бакай Банк: {fmt_rate(bakai_rate)}")
+    lines.append(f"АБанк: {fmt_rate(aiyl_rate)}")
+    lines.append(f"НБКР: {fmt_rate(nbkr_rate)}")
+    lines.append("")
+
+    available_banks = []
+    if bakai_rate:
+        available_banks.append(("Бакай Банк", bakai_rate))
+    if aiyl_rate:
+        available_banks.append(("АБанк", aiyl_rate))
+
+    if available_banks:
+        best_bank, best_rate = min(available_banks, key=lambda x: x[1])
+        lines.append(f"Лучший курс сейчас: {best_bank} — {fmt_rate(best_rate)}")
+        lines.append("")
+
+    if nbkr_rate:
+        lines.append("Спред к НБКР:")
+        if bakai_rate:
+            spread = (bakai_rate / nbkr_rate - 1) * 100
+            lines.append(f"Бакай Банк: {fmt_pct(spread)}")
+        if aiyl_rate:
+            spread = (aiyl_rate / nbkr_rate - 1) * 100
+            lines.append(f"АБанк: {fmt_pct(spread)}")
+        lines.append("")
+
+    lines.append("Источники:")
+    lines.append(f"• {rates_data.get('bakai_source')}")
+    lines.append(f"• {rates_data.get('aiyl_source')}")
+    lines.append(f"• {rates_data.get('nbkr_source')}")
+    lines.append("")
+    lines.append("Комментарий: это быстрое текущее сравнение двух банков. Для широкого рынка используйте «📈 История курсов».")
+
+    return "\n".join(lines)
+
+
+# =========================
+# ИСТОРИЧЕСКИЙ АНАЛИЗ
+# =========================
 
 def parse_history_period(text: str) -> Tuple[Optional[datetime], Optional[datetime], Optional[str]]:
     normalized = text.strip().lower()
@@ -884,6 +840,7 @@ def find_history_bank(text: str) -> Optional[Dict[str, Any]]:
         "a bank": "АБанк",
         "abank": "АБанк",
         "а банк": "АБанк",
+        "a-bank": "АБанк",
         "бакай": "Бакай Банк",
         "оптима": "Оптима Банк",
         "кикб": "КИКБ",
@@ -935,36 +892,10 @@ def build_bank_selection_message() -> str:
     lines.append("5")
     lines.append("MBANK")
     lines.append("Бакай")
+    lines.append("АБанк")
     lines.append("КИКБ")
 
     return "\n".join(lines)
-
-
-def get_nbkr_history_rates(start: datetime, end: datetime) -> Dict[Any, Dict[str, Any]]:
-    """
-    Возвращает словарь:
-    {
-        date: {
-            "rate": 1.0732,
-            "actual_date": date(...)
-        }
-    }
-    """
-    result = {}
-    current = start
-
-    while current.date() <= end.date():
-        rate, actual_date = get_nbkr_rate_for_history_date(current)
-
-        if rate:
-            result[current.date()] = {
-                "rate": rate,
-                "actual_date": actual_date.date() if actual_date else current.date(),
-            }
-
-        current += timedelta(days=1)
-
-    return result
 
 
 def calculate_bank_history_summary(
@@ -1049,6 +980,7 @@ def build_history_message(
     end: datetime,
     summaries: List[Dict[str, Any]],
     no_data_banks: List[str],
+    nbkr_partial: bool,
 ) -> str:
     period_text = (
         format_date(start)
@@ -1088,6 +1020,13 @@ def build_history_message(
         lines.append(f"средний: {fmt_rate(mean(nbkr_values))}")
         lines.append(f"минимум: {fmt_rate(min(nbkr_values))}")
         lines.append(f"максимум: {fmt_rate(max(nbkr_values))}")
+        if nbkr_partial:
+            lines.append("часть дат НБКР не загрузилась, спред рассчитан только по доступным датам")
+        lines.append("")
+    else:
+        lines.append("НБКР за период: н/д")
+        lines.append("Спред к НБКР: н/д")
+        lines.append("НБКР временно не ответил, поэтому спред не рассчитан.")
         lines.append("")
 
     lines.append("Средний спред к НБКР:")
@@ -1147,6 +1086,8 @@ def build_history_message(
             f" Наименьший средний спред к НБКР был у {best_spread['bank_name']} — "
             f"{fmt_pct(best_spread['avg_spread_pct'])}."
         )
+    elif nbkr_partial:
+        comment += " Спред к НБКР рассчитан частично или не рассчитан из-за недоступности НБКР."
 
     comment += " Данные приведены для анализа рынка."
     lines.append(comment)
@@ -1178,6 +1119,12 @@ def build_history_message(
         lines_short.append(f"средний: {fmt_rate(mean(nbkr_values))}")
         lines_short.append(f"минимум: {fmt_rate(min(nbkr_values))}")
         lines_short.append(f"максимум: {fmt_rate(max(nbkr_values))}")
+        if nbkr_partial:
+            lines_short.append("часть дат НБКР не загрузилась")
+        lines_short.append("")
+    else:
+        lines_short.append("НБКР за период: н/д")
+        lines_short.append("Спред к НБКР: н/д")
         lines_short.append("")
 
     lines_short.append("Средний спред к НБКР:")
@@ -1212,9 +1159,11 @@ def build_history_message(
     return "\n".join(lines_short)
 
 
-def get_history_analysis(start: datetime, end: datetime) -> str:
-    nbkr_rates_by_date = get_nbkr_history_rates(start, end)
-
+def get_market_summaries(
+    start: datetime,
+    end: datetime,
+    nbkr_rates_by_date: Dict[Any, Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     summaries = []
     no_data_banks = []
 
@@ -1236,7 +1185,13 @@ def get_history_analysis(start: datetime, end: datetime) -> str:
         else:
             no_data_banks.append(bank["name"])
 
-    return build_history_message(start, end, summaries, no_data_banks)
+    return summaries, no_data_banks
+
+
+def get_history_analysis(start: datetime, end: datetime) -> str:
+    nbkr_rates_by_date, nbkr_partial = get_nbkr_history_rates(start, end)
+    summaries, no_data_banks = get_market_summaries(start, end, nbkr_rates_by_date)
+    return build_history_message(start, end, summaries, no_data_banks, nbkr_partial)
 
 
 def build_single_bank_history_message(
@@ -1244,17 +1199,19 @@ def build_single_bank_history_message(
     start: datetime,
     end: datetime,
 ) -> str:
-    nbkr_rates_by_date = get_nbkr_history_rates(start, end)
+    nbkr_rates_by_date, nbkr_partial = get_nbkr_history_rates(start, end)
 
-    selected_history = fetch_bank_history_from_bankskg(selected_bank["id"])
-    selected_summary = calculate_bank_history_summary(
-        bank_name=selected_bank["name"],
-        organization_id=selected_bank["id"],
-        sell_points=selected_history.get("sell", []),
-        nbkr_rates_by_date=nbkr_rates_by_date,
-        start=start,
-        end=end,
+    market_summaries, _no_data_banks = get_market_summaries(
+        start,
+        end,
+        nbkr_rates_by_date,
     )
+
+    selected_summary = None
+    for item in market_summaries:
+        if item["organization_id"] == selected_bank["id"]:
+            selected_summary = item
+            break
 
     period_text = (
         format_date(start)
@@ -1269,21 +1226,6 @@ def build_single_bank_history_message(
             "Тип курса: безналичная продажа RUB\n\n"
             "За выбранный период данные по этому банку не найдены."
         )
-
-    market_summaries = []
-
-    for bank in HISTORY_BANKS:
-        history = fetch_bank_history_from_bankskg(bank["id"])
-        summary = calculate_bank_history_summary(
-            bank_name=bank["name"],
-            organization_id=bank["id"],
-            sell_points=history.get("sell", []),
-            nbkr_rates_by_date=nbkr_rates_by_date,
-            start=start,
-            end=end,
-        )
-        if summary:
-            market_summaries.append(summary)
 
     def get_rank(
         items: List[Dict[str, Any]],
@@ -1341,6 +1283,8 @@ def build_single_bank_history_message(
     lines.append(f"средний: {fmt_rate(selected_summary['avg_nbkr_rate'])}")
     lines.append(f"минимум: {fmt_rate(selected_summary['min_nbkr_rate'])}")
     lines.append(f"максимум: {fmt_rate(selected_summary['max_nbkr_rate'])}")
+    if nbkr_partial:
+        lines.append("часть дат НБКР не загрузилась, спред рассчитан только по доступным датам")
     lines.append("")
 
     lines.append("Спред к НБКР:")
@@ -1376,6 +1320,9 @@ def build_single_bank_history_message(
     if selected_summary.get("negative_spread_points", 0) > 0:
         comment += " Есть точки ниже НБКР, их нужно проверить как возможную аномалию источника или сопоставления дат."
 
+    if nbkr_partial:
+        comment += " НБКР был доступен не по всем датам, поэтому спред мог быть рассчитан частично."
+
     comment += " Данные приведены для анализа рынка."
 
     lines.append(comment)
@@ -1397,8 +1344,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         "Привет! Я бот для мониторинга RUB / KGS.\n\n"
-        "Я показываю текущие курсы, считаю спред к НБКР, помогаю рассчитать сумму "
-        "для конвертации и анализирую историю курсов по банкам.\n\n"
+        "Я показываю быстрое сравнение Бакай / A-bank, считаю спред к НБКР, "
+        "помогаю рассчитать сумму для конвертации и анализирую историю курсов по банкам.\n\n"
         "Выберите действие кнопкой ниже."
     )
 
@@ -1419,11 +1366,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = (
         "❓ Помощь\n\n"
         "Что умеет бот:\n\n"
-        "📊 Курсы сейчас\n"
-        "Показывает текущие курсы RUB / KGS по банкам и спред к НБКР.\n\n"
+        "⚖️ Бакай / A-bank сейчас\n"
+        "Показывает быстрое текущее сравнение безналичной продажи RUB по Бакай Банку и A-bank, "
+        "а также спред к НБКР.\n\n"
         "🧮 Калькулятор\n"
         "Можно ввести сумму RUB, которую нужно купить. Бот рассчитает, сколько KGS потребуется "
-        "по доступным курсам.\n\n"
+        "по доступным текущим курсам Бакай / A-bank.\n\n"
         "📈 История курсов\n"
         "Показывает историю безналичной продажи RUB по банкам за выбранную дату или период. "
         "Бот считает лучший средний курс, минимальный и максимальный курс за период, "
@@ -1441,7 +1389,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Бот будет присылать курсы по рабочим дням по времени Бишкека: "
         "07:00, 09:00, 11:00, 13:00, 15:00, 17:00.\n\n"
         "Важно: исторические данные используются для анализа рынка. "
-        "Фактическая возможность конвертации зависит от банка, лимитов, ликвидности и доступности курса."
+        "Если НБКР временно не отвечает, бот всё равно покажет рыночные курсы банков, "
+        "но спред к НБКР может быть не рассчитан или рассчитан частично."
     )
 
     await update.message.reply_text(
@@ -1509,7 +1458,7 @@ async def calc_amount_received(update: Update, context: ContextTypes.DEFAULT_TYP
     if rates_data.get("bakai_rate"):
         bank_rates.append(("Бакай Банк", rates_data["bakai_rate"]))
     if rates_data.get("aiyl_rate"):
-        bank_rates.append(("Айыл Банк / A-bank", rates_data["aiyl_rate"]))
+        bank_rates.append(("АБанк", rates_data["aiyl_rate"]))
 
     if not bank_rates:
         lines.append("Не удалось получить доступные курсы банков.")
@@ -1632,6 +1581,7 @@ async def bank_selected_received(update: Update, context: ContextTypes.DEFAULT_T
             "5\n"
             "MBANK\n"
             "Бакай\n"
+            "АБанк\n"
             "КИКБ",
             reply_markup=main_keyboard(update.effective_chat.id if update.effective_chat else None),
         )
@@ -1978,3 +1928,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
